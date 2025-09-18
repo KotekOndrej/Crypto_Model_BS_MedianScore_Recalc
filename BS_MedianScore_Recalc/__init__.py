@@ -7,7 +7,6 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 from azure.storage.blob import BlobServiceClient
-
 import azure.functions as func
 
 
@@ -39,28 +38,23 @@ def _get_env_int(name: str, default: int) -> int:
 # =========================
 # ------- Parametry -------
 # =========================
-# Vše lze přepsat přes ENV (App Settings):
-#   N_DAYS               (int)    - počet dnů historie pro trénink/histogram (default 20)
-#   MIN_DAYS_REQUIRED    (int)    - minimální počet dnů, aby výpočet dával smysl (default 12)
-#   COSTS_PCT            (float)  - náklady v PROCENTECH ceny na 1 cyklus (např. 0.001 = 0.1 %) (default 0.001)
-#   GAP_MIN_PCT          (float)  - minimální gap mezi S a B v PROCENTECH průměrné ceny (default 0.003 = 0.3 %)
+# Přes App Settings / ENV lze přepsat:
+#   N_DAYS (int), MIN_DAYS_REQUIRED (int),
+#   COSTS_PCT (float)  -> náklady v procentech ceny na cyklus (např. 0.001 = 0.1 %)
+#   GAP_MIN_PCT (float)-> minimální gap v procentech průměrné ceny (0.003 = 0.3 %)
 
 N_DAYS = _get_env_int("N_DAYS", 20)
 MIN_DAYS_REQUIRED = _get_env_int("MIN_DAYS_REQUIRED", 12)
 COSTS_PCT = _get_env_float("COSTS_PCT", 0.001)     # 0.001 => 0.1 %
 GAP_MIN_PCT = _get_env_float("GAP_MIN_PCT", 0.003) # 0.003 => 0.3 %
 
-PEAKS_K = 60                # max počet kandidátních vrcholů histogramu
+PEAKS_K = 60
 EU_TZ = ZoneInfo("Europe/Prague")
 MODEL_NAME = "BS_MedianScore"
 
-# =========================
-# ---- Azure nastavení ----
-# =========================
-
+# Azure připojení
 IN_CONN_STR = os.getenv("INPUT_BLOB_CONNECTION_STRING")
 IN_CONTAINER = os.getenv("INPUT_CONTAINER", "market-data")
-
 OUT_CONN_STR = os.getenv("OUTPUT_BLOB_CONNECTION_STRING")
 OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
 
@@ -70,9 +64,6 @@ OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
 # =========================
 
 def extract_pair_from_filename(blob_name: str) -> str:
-    """
-    Např. 'XRPUSDT_1m.csv' -> 'XRPUSDT'
-    """
     base = os.path.splitext(os.path.basename(blob_name))[0]
     for sep in ['_', '-']:
         if sep in base:
@@ -123,11 +114,6 @@ def bin_center(bins, i):
     return 0.5 * (bins[i] + bins[i + 1])
 
 def simulate_day_no_timeout_side(B, S, L, H, costs_abs=0.0, side="both"):
-    """
-    Jednoduchý 'ping-pong' bez timeoutu.
-    side: "both" (obousměrně), "long" (jen B->S), "short" (jen S->B)
-    costs_abs: absolutní náklad na 1 cyklus (v jednotkách ceny)
-    """
     pnl = 0.0
     cycles = 0
     pos = 0
@@ -211,9 +197,8 @@ def predict_proba_logreg(w, xrow):
 
 def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
     """
-    Vstupní CSV musí mít sloupce: closeTimeISO, low, high
-    - COSTS_PCT: náklad v procentech ceny; v simulaci převádíme na absolutní náklad
-                 jako COSTS_PCT * ((B+S)/2) a odečítáme na každý dokončený cyklus.
+    Vstupní CSV: sloupce closeTimeISO, low, high
+    COSTS_PCT: z App Settings, např. 0.001 = 0.1 % náklad na cyklus (přepočteme na absolutní cenu).
     """
     df = pd.read_csv(io.BytesIO(csv_bytes))
     required = {"closeTimeISO", "low", "high"}
@@ -242,7 +227,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         logging.warning(f"{pair_name}: málo použitelných dnů v okně – přeskočeno.")
         return None
 
-    # Histogram dotyků přes okno
+    # Histogram dotyků
     p_min = min(float(l.min()) for l, _ in history)
     p_max = max(float(h.max()) for _, h in history)
     bins = make_bins(p_min, p_max, n_bins=600)
@@ -251,22 +236,22 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         hist += build_touch_hist_day(L, H, bins)
     hist_smooth = gaussian_smooth(hist, sigma_bins=3)
 
-    # Denní OHLC proxy + price-only features
+    # Denní OHLC proxy + featury
     daily_closes = [float(np.mean((L + H) / 2)) for (L, H) in history]
-    daily_opens = [float((L[0] + H[0]) / 2) for (L, H) in history]
-    daily_highs = [float(H.max()) for (_, H) in history]
-    daily_lows = [float(L.min()) for (L, _) in history]
+    daily_opens  = [float((L[0] + H[0]) / 2)    for (L, H) in history]
+    daily_highs  = [float(H.max())              for (_, H) in history]
+    daily_lows   = [float(L.min())              for (L, _) in history]
 
     closes = np.array(daily_closes, dtype=float)
-    opens = np.array(daily_opens, dtype=float)
-    highs = np.array(daily_highs, dtype=float)
-    lows = np.array(daily_lows, dtype=float)
+    opens  = np.array(daily_opens, dtype=float)
+    highs  = np.array(daily_highs, dtype=float)
+    lows   = np.array(daily_lows, dtype=float)
 
     X = price_only_features(opens, highs, lows, closes)
     y = (np.roll(closes, -1) > closes).astype(int)[:-1]
     X = X[:-1, :]
 
-    # Režim (bull/side/bear) z price-only logreg
+    # Režim dne
     if len(y) < 5:
         side = "both"
     else:
@@ -274,7 +259,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         p_up = predict_proba_logreg(w, X[-1])
         side = "long" if p_up >= 0.6 else "short" if p_up <= 0.4 else "both"
 
-    # Kandidáti z vrcholů histogramu v okolí aktuální ceny
+    # Kandidáti levelů
     peak_idx = find_local_peaks(hist_smooth, k_peaks=PEAKS_K, min_separation=2)
     levels = [bin_center(bins, i) for i in peak_idx]
     current_price = closes[-1]
@@ -286,7 +271,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
 
     pairs = [(B, S) for B in lower for S in upper if (S - B) >= min_gap_abs]
     if not pairs:
-        # fallback: širší okolí levelů
+        # fallback: větší výběr
         lower = sorted([lv for lv in levels if lv <= current_price])[:30]
         upper = sorted([lv for lv in levels if lv >= current_price])[:30]
         pairs = [(B, S) for B in lower for S in upper if (S - B) >= min_gap_abs]
@@ -294,26 +279,20 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
             logging.warning(f"{pair_name}: žádné páry nesplňují gap ≥ {GAP_MIN_PCT*100:.2f}% – přeskočeno.")
             return None
 
-    # Ohodnocení kandidátů přes celé okno (bez timeoutu), režimově omezené vstupy
+    # Ohodnocení kandidátů přes celé okno (bez timeoutu)
     best = None
     for (B, S) in pairs:
-        # Přepočet nákladů na absolutní hodnotu z procent:
-        # vezmeme střed páru jako referenční cenu pro náklad na cyklus
-        costs_abs = COSTS_PCT * ((B + S) / 2.0)
-
+        costs_abs = COSTS_PCT * ((B + S) / 2.0)  # náklad v absolutní ceně na cyklus
         pnls, cyc = [], []
         for L, H in history:
             p, c = simulate_day_no_timeout_side(B, S, L, H, costs_abs=costs_abs, side=side)
             pnls.append(p)
             cyc.append(c)
         pnls = np.array(pnls, dtype=float)
-        # MedianScore: median(PnL) - 0.25 * IQR(PnL)
         med = float(np.median(pnls))
         iqr = float(np.percentile(pnls, 75) - np.percentile(pnls, 25))
         score = med - 0.25 * iqr
-        mean_cyc = float(np.mean(cyc))
-        mean_pnl = float(np.mean(pnls))
-        cand = (score, mean_cyc, mean_pnl, B, S)
+        cand = (score, B, S)
         if (best is None) or (cand > best):
             best = cand
 
@@ -321,7 +300,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         logging.error(f"{pair_name}: nepodařilo se vybrat nejlepší pár.")
         return None
 
-    _, _, _, bestB, bestS = best
+    _, bestB, bestS = best
     gap_pct = 100.0 * (bestS - bestB) / max(bestB, 1e-12)
 
     return {
@@ -334,18 +313,18 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
 
 
 # =========================
-# ------ Azure Func -------
+# ------ Entry point ------
 # =========================
 
-app = func.FunctionApp()
-
-@app.function_name(name="BSFinderTimer")
-@app.schedule(schedule="0 5 5 * * *", arg_name="myTimer", run_on_startup=False, use_monitor=True)
 def main(myTimer: func.TimerRequest) -> None:
+    """
+    Entry point funkce BSMedianScoreRecalc (timer trigger je definován ve function.json).
+    """
     now_prg = datetime.now(tz=EU_TZ)
     date_str = now_prg.strftime("%Y-%m-%d")
+    func_name = "BSMedianScoreRecalc"
 
-    logging.info(f"[BSFinder] Start {date_str} | N_DAYS={N_DAYS} MIN_DAYS_REQUIRED={MIN_DAYS_REQUIRED} COSTS_PCT={COSTS_PCT} GAP_MIN_PCT={GAP_MIN_PCT}")
+    logging.info(f"[{func_name}] Start {date_str} | N_DAYS={N_DAYS} MIN_DAYS_REQUIRED={MIN_DAYS_REQUIRED} COSTS_PCT={COSTS_PCT} GAP_MIN_PCT={GAP_MIN_PCT}")
 
     in_client = BlobServiceClient.from_connection_string(IN_CONN_STR)
     out_client = BlobServiceClient.from_connection_string(OUT_CONN_STR)
@@ -363,8 +342,7 @@ def main(myTimer: func.TimerRequest) -> None:
             continue
         pair_name = extract_pair_from_filename(blob.name)
         try:
-            b = in_container.get_blob_client(blob)
-            csv_bytes = b.download_blob().readall()
+            csv_bytes = in_container.get_blob_client(blob).download_blob().readall()
             res = compute_bs_for_csv_bytes(csv_bytes, pair_name)
             if res is None:
                 continue
@@ -376,19 +354,19 @@ def main(myTimer: func.TimerRequest) -> None:
                 "date": date_str,
                 "model": res["model"]
             })
-            logging.info(f"[BSFinder] {pair_name}: B={float(res['B']):.6f}, S={float(res['S']):.6f}, gap={float(res['gap_pct']):.3f}%")
+            logging.info(f"[{func_name}] {pair_name}: B={float(res['B']):.6f}, S={float(res['S']):.6f}, gap={float(res['gap_pct']):.3f}%")
         except Exception as e:
-            logging.exception(f"[BSFinder] Chyba při zpracování {pair_name}: {e}")
+            logging.exception(f"[{func_name}] Chyba při zpracování {pair_name}: {e}")
 
     if not rows:
-        logging.warning("[BSFinder] Nebyly vyprodukovány žádné výsledky (žádné validní páry).")
+        logging.warning(f"[{func_name}] Nebyly vyprodukovány žádné výsledky (žádné validní páry).")
         return
 
     out_df = pd.DataFrame(rows, columns=["pair", "B", "S", "gap_pct", "date", "model"])
     out_csv = out_df.to_csv(index=False).encode("utf-8")
 
     out_name = f"bs_levels_{date_str}.csv"
-    out_blob = out_container.get_blob_client(out_name)
+    out_blob = out_client.get_container_client(OUT_CONTAINER).get_blob_client(out_name)
     out_blob.upload_blob(out_csv, overwrite=True)
 
-    logging.info(f"[BSFinder] Zapsáno do {OUT_CONTAINER}/{out_name} ({len(rows)} řádků).")
+    logging.info(f"[{func_name}] Zapsáno do {OUT_CONTAINER}/{out_name} ({len(rows)} řádků).")
