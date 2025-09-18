@@ -1,13 +1,35 @@
 import os
 import io
+import sys
 import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 from azure.storage.blob import BlobServiceClient
 import azure.functions as func
+
+# ====== Robustní ZoneInfo (funguje na Python 3.8+ i bez systémového tzdata) ======
+try:
+    # Python 3.9+
+    from zoneinfo import ZoneInfo  # type: ignore
+except Exception:
+    try:
+        # Backport pro Python < 3.9
+        from backports.zoneinfo import ZoneInfo  # type: ignore
+    except Exception:
+        ZoneInfo = None  # fallback níže
+
+TZ_NAME = os.getenv("WEBSITE_TIME_ZONE", "Europe/Prague")
+if ZoneInfo is not None:
+    try:
+        EU_TZ = ZoneInfo(TZ_NAME)
+    except Exception:
+        logging.warning(f"[TZ] ZoneInfo('{TZ_NAME}') nedostupné – přepínám na UTC.")
+        EU_TZ = timezone.utc
+else:
+    logging.warning("[TZ] ZoneInfo modul není k dispozici – přepínám na UTC.")
+    EU_TZ = timezone.utc
 
 
 # =========================
@@ -38,7 +60,7 @@ def _get_env_int(name: str, default: int) -> int:
 # =========================
 # ------- Parametry -------
 # =========================
-# Přes App Settings / ENV lze přepsat:
+# Lze přepsat přes App Settings:
 #   N_DAYS (int), MIN_DAYS_REQUIRED (int),
 #   COSTS_PCT (float)  -> náklady v procentech ceny na cyklus (např. 0.001 = 0.1 %)
 #   GAP_MIN_PCT (float)-> minimální gap v procentech průměrné ceny (0.003 = 0.3 %)
@@ -49,10 +71,9 @@ COSTS_PCT = _get_env_float("COSTS_PCT", 0.001)     # 0.001 => 0.1 %
 GAP_MIN_PCT = _get_env_float("GAP_MIN_PCT", 0.003) # 0.003 => 0.3 %
 
 PEAKS_K = 60
-EU_TZ = ZoneInfo("Europe/Prague")
 MODEL_NAME = "BS_MedianScore"
 
-# Azure připojení (POZOR: vracíme se k původním názvům)
+# Azure připojení (původní názvy proměnných)
 IN_CONN_STR = os.getenv("INPUT_BLOB_CONNECTION_STRING")
 IN_CONTAINER = os.getenv("INPUT_CONTAINER", "market-data")
 OUT_CONN_STR = os.getenv("OUTPUT_BLOB_CONNECTION_STRING")
@@ -114,6 +135,11 @@ def bin_center(bins, i):
     return 0.5 * (bins[i] + bins[i + 1])
 
 def simulate_day_no_timeout_side(B, S, L, H, costs_abs=0.0, side="both"):
+    """
+    Jednoduchý 'ping-pong' bez timeoutu.
+    side: "both" (obousměrně), "long" (jen B->S), "short" (jen S->B)
+    costs_abs: absolutní náklad na 1 cyklus (v jednotkách ceny)
+    """
     pnl = 0.0
     cycles = 0
     pos = 0
@@ -324,10 +350,9 @@ def main(myTimer: func.TimerRequest) -> None:
     date_str = now_prg.strftime("%Y-%m-%d")
     func_name = "BSMedianScoreRecalc"
 
-    # Základní info log
     logging.info(
-        f"[{func_name}] Start {date_str} | "
-        f"N_DAYS={N_DAYS} MIN_DAYS_REQUIRED={MIN_DAYS_REQUIRED} "
+        f"[{func_name}] Start {date_str} | Python={sys.version.split()[0]} | TZ={TZ_NAME} "
+        f"| N_DAYS={N_DAYS} MIN_DAYS_REQUIRED={MIN_DAYS_REQUIRED} "
         f"COSTS_PCT={COSTS_PCT} GAP_MIN_PCT={GAP_MIN_PCT} | "
         f"IN_CONTAINER={IN_CONTAINER} OUT_CONTAINER={OUT_CONTAINER}"
     )
