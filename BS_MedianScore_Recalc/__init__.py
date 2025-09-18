@@ -52,11 +52,11 @@ PEAKS_K = 60
 EU_TZ = ZoneInfo("Europe/Prague")
 MODEL_NAME = "BS_MedianScore"
 
-# Azure připojení
-INPUT_BLOB_CONNECTION_STRING = os.getenv("INPUT_BLOB_CONNECTION_STRING")
-INPUT_CONTAINER = os.getenv("INPUT_CONTAINER", "market-data")
-OUTPUT_BLOB_CONNECTION_STRING = os.getenv("OUTPUT_BLOB_CONNECTION_STRING")
-OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
+# Azure připojení (POZOR: vracíme se k původním názvům)
+IN_CONN_STR = os.getenv("INPUT_BLOB_CONNECTION_STRING")
+IN_CONTAINER = os.getenv("INPUT_CONTAINER", "market-data")
+OUT_CONN_STR = os.getenv("OUTPUT_BLOB_CONNECTION_STRING")
+OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
 
 
 # =========================
@@ -324,27 +324,48 @@ def main(myTimer: func.TimerRequest) -> None:
     date_str = now_prg.strftime("%Y-%m-%d")
     func_name = "BSMedianScoreRecalc"
 
-    logging.info(f"[{func_name}] Start {date_str} | N_DAYS={N_DAYS} MIN_DAYS_REQUIRED={MIN_DAYS_REQUIRED} COSTS_PCT={COSTS_PCT} GAP_MIN_PCT={GAP_MIN_PCT}")
+    # Základní info log
+    logging.info(
+        f"[{func_name}] Start {date_str} | "
+        f"N_DAYS={N_DAYS} MIN_DAYS_REQUIRED={MIN_DAYS_REQUIRED} "
+        f"COSTS_PCT={COSTS_PCT} GAP_MIN_PCT={GAP_MIN_PCT} | "
+        f"IN_CONTAINER={IN_CONTAINER} OUT_CONTAINER={OUT_CONTAINER}"
+    )
 
-    in_client = BlobServiceClient.from_connection_string(IN_CONN_STR)
-    out_client = BlobServiceClient.from_connection_string(OUT_CONN_STR)
-
-    in_container = in_client.get_container_client(IN_CONTAINER)
-    out_container = out_client.get_container_client(OUT_CONTAINER)
+    # Klienti Storage
     try:
-        out_container.create_container()
+        in_client = BlobServiceClient.from_connection_string(IN_CONN_STR)
+        out_client = BlobServiceClient.from_connection_string(OUT_CONN_STR)
     except Exception:
-        pass
+        logging.exception(f"[{func_name}] Nelze vytvořit BlobServiceClient – zkontroluj connection stringy.")
+        return
+
+    in_container_client = in_client.get_container_client(IN_CONTAINER)
+    out_container_client = out_client.get_container_client(OUT_CONTAINER)
+
+    # vytvoř výstupní container (pokud neexistuje)
+    try:
+        out_container_client.create_container()
+    except Exception:
+        pass  # už existuje
 
     rows = []
-    for blob in in_container.list_blobs():
+    try:
+        blobs = list(in_container_client.list_blobs())
+        logging.info(f"[{func_name}] Nalezeno {len(blobs)} objektů v '{IN_CONTAINER}'.")
+    except Exception:
+        logging.exception(f"[{func_name}] Chyba při listování blobů v '{IN_CONTAINER}'.")
+        return
+
+    for blob in blobs:
         if not blob.name.lower().endswith(".csv"):
             continue
         pair_name = extract_pair_from_filename(blob.name)
         try:
-            csv_bytes = in_container.get_blob_client(blob).download_blob().readall()
+            csv_bytes = in_container_client.get_blob_client(blob).download_blob().readall()
             res = compute_bs_for_csv_bytes(csv_bytes, pair_name)
             if res is None:
+                logging.warning(f"[{func_name}] Přeskakuji {blob.name} – žádný výsledek (málo dat / žádné páry).")
                 continue
             rows.append({
                 "pair": res["pair"],
@@ -354,19 +375,21 @@ def main(myTimer: func.TimerRequest) -> None:
                 "date": date_str,
                 "model": res["model"]
             })
-            logging.info(f"[{func_name}] {pair_name}: B={float(res['B']):.6f}, S={float(res['S']):.6f}, gap={float(res['gap_pct']):.3f}%")
-        except Exception as e:
-            logging.exception(f"[{func_name}] Chyba při zpracování {pair_name}: {e}")
+            logging.info(f"[{func_name}] OK {pair_name}: B={float(res['B']):.6f}, S={float(res['S']):.6f}, gap={float(res['gap_pct']):.3f}%")
+        except Exception:
+            logging.exception(f"[{func_name}] Chyba při zpracování {blob.name}")
+            continue
 
     if not rows:
-        logging.warning(f"[{func_name}] Nebyly vyprodukovány žádné výsledky (žádné validní páry).")
+        logging.warning(f"[{func_name}] Nebyly vyprodukovány žádné výsledky (žádné validní páry / žádná CSV).")
         return
 
     out_df = pd.DataFrame(rows, columns=["pair", "B", "S", "gap_pct", "date", "model"])
     out_csv = out_df.to_csv(index=False).encode("utf-8")
 
     out_name = f"bs_levels_{date_str}.csv"
-    out_blob = out_client.get_container_client(OUT_CONTAINER).get_blob_client(out_name)
-    out_blob.upload_blob(out_csv, overwrite=True)
-
-    logging.info(f"[{func_name}] Zapsáno do {OUT_CONTAINER}/{out_name} ({len(rows)} řádků).")
+    try:
+        out_container_client.get_blob_client(out_name).upload_blob(out_csv, overwrite=True)
+        logging.info(f"[{func_name}] Zapsáno do {OUT_CONTAINER}/{out_name} ({len(rows)} řádků).")
+    except Exception:
+        logging.exception(f"[{func_name}] Zápis výsledného CSV selhal.")
