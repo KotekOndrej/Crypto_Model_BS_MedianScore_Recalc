@@ -53,10 +53,10 @@ EU_TZ = ZoneInfo("Europe/Prague")
 MODEL_NAME = "BS_MedianScore"
 
 # Azure připojení
-IN_CONN_STR = os.getenv("INPUT_BLOB_CONNECTION_STRING")
-IN_CONTAINER = os.getenv("INPUT_CONTAINER", "market-data")
-OUT_CONN_STR = os.getenv("OUTPUT_BLOB_CONNECTION_STRING")
-OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
+INPUT_BLOB_CONNECTION_STRING = os.getenv("INPUT_BLOB_CONNECTION_STRING")
+INPUT_CONTAINER = os.getenv("INPUT_CONTAINER", "market-data")
+OUTPUT_BLOB_CONNECTION_STRING = os.getenv("OUTPUT_BLOB_CONNECTION_STRING")
+OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
 
 
 # =========================
