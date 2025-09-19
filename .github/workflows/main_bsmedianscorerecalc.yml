@@ -7,7 +7,7 @@ on:
 
 env:
   AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'     # kořen repa (musí obsahovat host.json)
-  PYTHON_VERSION: '3.11'                  # verze Pythonu (doporučuji mít stejnou i ve Function App)
+  PYTHON_VERSION: '3.11'                  # stejné nastavit i ve Function App
 
 jobs:
   build:
@@ -29,19 +29,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # 🔧 OFFLINE BUILD: nainstalujeme balíčky do .python_packages/lib/site-packages
+      # OFFLINE BUILD: nainstalujeme balíčky do .python_packages/lib/site-packages
       - name: Install dependencies into .python_packages
         run: |
+          python -m pip install --upgrade pip
           mkdir -p .python_packages/lib/site-packages
-          pip install --upgrade pip
           pip install -r requirements.txt -t .python_packages/lib/site-packages
-          # Ověření, že numpy/pandas skutečně existují v balíku
-          python - << 'PY'
-import os
-base=".python_packages/lib/site-packages"
-missing=[p for p in ["numpy","pandas","azure","azure/storage","azure/storage/blob"] if not os.path.exists(os.path.join(base,p.split("/")[-1]))]
-print("Missing-in-bundle:", missing)
-PY
 
       # Zabalíme repozitář vč. .python_packages (vynecháme venv, .git, atd.)
       - name: Zip artifact for deployment (including .python_packages)
@@ -52,7 +45,7 @@ PY
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: python-app
+          name: function-package
           path: release.zip
 
   deploy:
@@ -66,13 +59,9 @@ PY
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: python-app
+          name: function-package
 
-      - name: Unzip artifact
-        run: |
-          unzip release.zip
-          rm release.zip
-
+      # nasadíme přímo ZIP (není potřeba rozbalovat)
       - name: Azure login (federated credentials)
         uses: azure/login@v2
         with:
@@ -83,7 +72,7 @@ PY
       - name: Deploy to Azure Functions (offline package)
         uses: Azure/functions-action@v1
         with:
-          app-name: 'BSMedianScoreRecalc'
+          app-name: 'BSMedianScoreRecalc'          # název Function App resource v Azure
           slot-name: 'Production'
-          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          # server-side build NENÍ třeba (závislosti už jsou uvnitř .python_packages)
+          package: release.zip                     # nasazujeme připravený zip
+          # server-side build není potřeba (balíčky už jsou v .python_packages)
