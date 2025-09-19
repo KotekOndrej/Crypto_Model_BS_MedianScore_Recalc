@@ -1,6 +1,4 @@
 azure-functions
 azure-storage-blob>=12.10.0
-pandas
-numpy
-backports.zoneinfo; python_version < "3.9"
-tzdata
+numpy==1.26.4
+pandas==2.2.2
