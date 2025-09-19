@@ -1,7 +1,3 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/azure/functions-action
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-# More info on Python, GitHub Actions, and Azure Functions: https://aka.ms/python-webapps-actions
-
 name: Build and deploy Python project to Azure Function App - BSMedianScoreRecalc
 
 on:
@@ -11,51 +7,42 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.' # set this to the path to your web app project, defaults to the repository root
-  PYTHON_VERSION: '3.11' # set this to the python version to use (supports 3.6, 3.7, 3.8)
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'   # kořen repozitáře (musí obsahovat host.json a requirements.txt)
+  PYTHON_VERSION: '3.11'               # verze Pythonu (mít stejně nastaveno i ve Function App)
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      contents: read
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python version
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Create and start virtual environment
+      # (Volitelně) rychlá validace, že requirements existuje
+      - name: Ensure requirements.txt exists
         run: |
-          python -m venv venv
-          source venv/bin/activate
+          test -f requirements.txt || (echo "requirements.txt not found at repo root" && exit 1)
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      # Optional: Add step to run tests here
-
+      # Vytvoříme ZIP s obsahem repa (bez lokálních venv apod.)
       - name: Zip artifact for deployment
-        run: zip release.zip ./* -r
+        run: |
+          zip -r release.zip . \
+            -x "venv/*" ".venv/*" "__pycache__/*" "*.pyc" ".git/*" ".github/*"
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: |
-            release.zip
-            !venv/
+          path: release.zip
 
   deploy:
     runs-on: ubuntu-latest
     needs: build
     permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
+      id-token: write
+      contents: read
 
     steps:
       - name: Download artifact from build job
@@ -67,19 +54,18 @@ jobs:
         run: |
           unzip release.zip
           rm release.zip
-        
-      - name: Login to Azure
+
+      - name: Login to Azure (federated credentials)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_321D82075BDC4163A849264F591A5461 }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_35907C31349540AA8055D3A4057017A6 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_AC45552715DD44E3933302C3E0083EE9 }}
 
-      - name: 'Deploy to Azure Functions'
+      - name: Deploy to Azure Functions (enable server-side build)
         uses: Azure/functions-action@v1
-        id: deploy-to-function
         with:
-          app-name: 'BSMedianScoreRecalc'
+          app-name: 'BSMedianScoreRecalc'                 # název Function App v Azure
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          
+          scm-do-build-during-deployment: true           # <<< DŮLEŽITÉ: Oryx build + pip install na serveru
