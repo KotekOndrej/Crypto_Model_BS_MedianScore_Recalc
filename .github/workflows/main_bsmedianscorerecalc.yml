@@ -2,13 +2,12 @@ name: Build and deploy Python project to Azure Function App - BSMedianScoreRecal
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'   # kořen repozitáře (musí obsahovat host.json a requirements.txt)
-  PYTHON_VERSION: '3.11'               # verze Pythonu (mít stejně nastaveno i ve Function App)
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'     # kořen repa (musí obsahovat host.json)
+  PYTHON_VERSION: '3.11'                  # verze Pythonu (doporučuji mít stejnou i ve Function App)
 
 jobs:
   build:
@@ -20,18 +19,37 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # (Volitelně) rychlá validace, že requirements existuje
-      - name: Ensure requirements.txt exists
+      - name: Ensure required files exist
         run: |
+          test -f host.json || (echo "host.json not found at repo root" && exit 1)
           test -f requirements.txt || (echo "requirements.txt not found at repo root" && exit 1)
 
-      # Vytvoříme ZIP s obsahem repa (bez lokálních venv apod.)
-      - name: Zip artifact for deployment
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # 🔧 OFFLINE BUILD: nainstalujeme balíčky do .python_packages/lib/site-packages
+      - name: Install dependencies into .python_packages
+        run: |
+          mkdir -p .python_packages/lib/site-packages
+          pip install --upgrade pip
+          pip install -r requirements.txt -t .python_packages/lib/site-packages
+          # Ověření, že numpy/pandas skutečně existují v balíku
+          python - << 'PY'
+import os
+base=".python_packages/lib/site-packages"
+missing=[p for p in ["numpy","pandas","azure","azure/storage","azure/storage/blob"] if not os.path.exists(os.path.join(base,p.split("/")[-1]))]
+print("Missing-in-bundle:", missing)
+PY
+
+      # Zabalíme repozitář vč. .python_packages (vynecháme venv, .git, atd.)
+      - name: Zip artifact for deployment (including .python_packages)
         run: |
           zip -r release.zip . \
             -x "venv/*" ".venv/*" "__pycache__/*" "*.pyc" ".git/*" ".github/*"
 
-      - name: Upload artifact for deployment job
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: python-app
@@ -45,27 +63,27 @@ jobs:
       contents: read
 
     steps:
-      - name: Download artifact from build job
+      - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: python-app
 
-      - name: Unzip artifact for deployment
+      - name: Unzip artifact
         run: |
           unzip release.zip
           rm release.zip
 
-      - name: Login to Azure (federated credentials)
+      - name: Azure login (federated credentials)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_321D82075BDC4163A849264F591A5461 }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_35907C31349540AA8055D3A4057017A6 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_AC45552715DD44E3933302C3E0083EE9 }}
 
-      - name: Deploy to Azure Functions (enable server-side build)
+      - name: Deploy to Azure Functions (offline package)
         uses: Azure/functions-action@v1
         with:
-          app-name: 'BSMedianScoreRecalc'                 # název Function App v Azure
+          app-name: 'BSMedianScoreRecalc'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          scm-do-build-during-deployment: true           # <<< DŮLEŽITÉ: Oryx build + pip install na serveru
+          # server-side build NENÍ třeba (závislosti už jsou uvnitř .python_packages)
