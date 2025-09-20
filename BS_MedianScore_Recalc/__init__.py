@@ -35,9 +35,9 @@ GAP_MIN_PCT = _get_env_float("GAP_MIN_PCT", 0.003) # 0.003 => 0.3 %
 PEAKS_K = 60
 MODEL_NAME = "BS_MedianScore"
 
-# Storage připojení (původní názvy proměnných)
-IN_CONN_STR  = os.getenv("INPUT_BLOB_CONNECTION_STRING")
-OUT_CONN_STR = os.getenv("OUTPUT_BLOB_CONNECTION_STRING")
+# Storage přes Managed Identity
+INPUT_ACCOUNT_NAME  = os.getenv("INPUT_ACCOUNT_NAME")
+OUTPUT_ACCOUNT_NAME = os.getenv("OUTPUT_ACCOUNT_NAME")
 IN_CONTAINER  = os.getenv("INPUT_CONTAINER", "market-data")
 OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
 
@@ -45,7 +45,7 @@ OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
 MASTER_CSV_NAME = "bs_levels_master.csv"      # historie + is_active
 DAILY_PREFIX    = "bs_levels_"                # denní snapshot
 
-# ============ Utility (nevyžadují import 3rd party při def.) ============
+# ============ Utility (bez 3rd party importů při definici) ============
 
 def extract_pair_from_filename(blob_name: str) -> str:
     base = os.path.splitext(os.path.basename(blob_name))[0]
@@ -53,19 +53,6 @@ def extract_pair_from_filename(blob_name: str) -> str:
         if sep in base:
             return base.split(sep)[0]
     return base
-
-def make_bins(p_min, p_max, n_bins=600):
-    if p_max <= p_min:
-        p_max = p_min * 1.001
-    # np.linspace použijeme až runtime – zde jen signatura
-
-def gaussian_smooth(x, sigma_bins=3):
-    # implementace až po importu numpy v main()
-    pass
-
-def build_touch_hist_day(L, H, bins):
-    # implementace až po importu numpy v main()
-    pass
 
 def find_local_peaks(y, k_peaks=60, min_separation=2):
     peaks = []
@@ -127,7 +114,6 @@ def rolling_std(arr, w):
     return out
 
 def price_only_features(opens, highs, lows, closes):
-    # použijeme čistý Python; konverzi na numpy uděláme až v simulaci
     ret_1d = [0.0] + [(closes[i] - closes[i-1]) / (closes[i-1] or 1e-9) for i in range(1, len(closes))]
     day_range = [(highs[i] - lows[i]) / (closes[i] or 1e-9) for i in range(len(closes))]
     close_open = [(closes[i] - opens[i]) / (opens[i] or 1e-9) for i in range(len(closes))]
@@ -143,25 +129,21 @@ def price_only_features(opens, highs, lows, closes):
     return X
 
 def logistic_regression_irls(X, y, max_iter=100, tol=1e-6, reg_lambda=1e-4):
-    # jednoduchá IRLS nad python listy (převedeme na float matice uvnitř)
     import math
 
     n = len(X)
     if n == 0:
         return [0.0] * (len(X[0]) + 1)
     d = len(X[0])
-    # Xb = [1|X]
     Xb = [[1.0] + list(row) for row in X]
     w = [0.0] * (d + 1)
 
-    def dot(u, v):
-        return sum(ui*vi for ui,vi in zip(u,v))
+    def dot(u, v): return sum(ui*vi for ui,vi in zip(u,v))
 
     for _ in range(max_iter):
         z = [dot(Xb[i], w) for i in range(n)]
         p = [1.0 / (1.0 + math.exp(-zi)) for zi in z]
         W = [pi * (1 - pi) for pi in p]
-        # H = Xb^T * W * Xb + lambda*I
         H = [[0.0]*(d+1) for _ in range(d+1)]
         g = [0.0]*(d+1)
         for i in range(n):
@@ -173,23 +155,17 @@ def logistic_regression_irls(X, y, max_iter=100, tol=1e-6, reg_lambda=1e-4):
         for a in range(d+1):
             H[a][a] += reg_lambda
             g[a] += reg_lambda * w[a]
-        # vyřeš H*step = g
-        # jednoduché Gaussovo řešení
-        # zkopíruj H a g do rozšířené matice
+        # Gauss
         A = [row[:] + [g[i]] for i, row in enumerate(H)]
-        # Gaussova eliminace
         for col in range(d+1):
-            # pivot
             piv = col
             for r in range(col+1, d+1):
                 if abs(A[r][col]) > abs(A[piv][col]):
                     piv = r
             A[col], A[piv] = A[piv], A[col]
             pivot = A[col][col] or 1e-12
-            # normalizace
             for c in range(col, d+2):
                 A[col][c] /= pivot
-            # vynuluj ostatní řádky v tomto sloupci
             for r in range(d+1):
                 if r == col: continue
                 factor = A[r][col]
@@ -214,11 +190,9 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
     Vstupní CSV: sloupce closeTimeISO, low, high
     COSTS_PCT: např. 0.001 = 0.1 % náklad/cyklus (přepočet na absolutní cenu dle středu páru)
     """
-    # --- IMPORTY 3rd party AŽ TADY (aby případný problém šel vidět v logu) ---
     import numpy as np
     import pandas as pd
 
-    # --- lokální implementace funkcí závislých na numpy ---
     def _make_bins(p_min, p_max, n_bins=600):
         if p_max <= p_min:
             p_max = p_min * 1.001
@@ -293,7 +267,6 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
     lows   = np.array(daily_lows, dtype=float)
 
     X = price_only_features(list(opens), list(highs), list(lows), list(closes))
-    # label: close_{t+1} > close_t
     y = (np.roll(closes, -1) > closes).astype(int).tolist()[:-1]
     X = X[:-1]
 
@@ -332,6 +305,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
             p, c = simulate_day_no_timeout_side(B, S, L, H, costs_abs=costs_abs, side=side)
             pnls.append(p)
             cyc.append(c)
+        import numpy as np  # jistota v této scope
         pnls = np.array(pnls, dtype=float)
         med = float(np.median(pnls))
         iqr = float(np.percentile(pnls, 75) - np.percentile(pnls, 25))
@@ -360,16 +334,19 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
 def main(myTimer):
     """
     Timer trigger definován ve function.json.
-    - Vytvoří denní snapshot s is_active=1 pro nové záznamy.
-    - Udržuje master CSV (bs_levels_master.csv) s jediným aktivním záznamem pro (pair, model).
+    - Čte z INPUT_ACCOUNT_NAME / INPUT_CONTAINER
+    - Zapisuje do OUTPUT_ACCOUNT_NAME / OUTPUT_CONTAINER
+    - Vytvoří denní snapshot s is_active=1
+    - Udržuje master CSV s jediným aktivním záznamem pro (pair, model)
     """
-    # Importy třetích stran až tady: když by něco chybělo, uvidíme to v logu.
+    # Importy až tady (lepší logování v případě chyb)
     try:
         import numpy as np
         import pandas as pd
+        from azure.identity import DefaultAzureCredential
         from azure.storage.blob import BlobServiceClient
     except Exception:
-        logging.exception("[BSMedianScoreRecalc] Import balíčků selhal (numpy/pandas/azure-storage-blob).")
+        logging.exception("[BSMedianScoreRecalc] Import balíčků selhal (numpy/pandas/azure-identity/azure-storage-blob).")
         return
 
     now_utc = datetime.now(timezone.utc)
@@ -380,25 +357,35 @@ def main(myTimer):
         f"[{func_name}] Start {date_str} UTC | Python={sys.version.split()[0]} "
         f"| N_DAYS={N_DAYS} MIN_DAYS_REQUIRED={MIN_DAYS_REQUIRED} "
         f"COSTS_PCT={COSTS_PCT} GAP_MIN_PCT={GAP_MIN_PCT} | "
+        f"INPUT_ACCOUNT_NAME={INPUT_ACCOUNT_NAME} OUTPUT_ACCOUNT_NAME={OUTPUT_ACCOUNT_NAME} "
         f"IN_CONTAINER={IN_CONTAINER} OUT_CONTAINER={OUT_CONTAINER}"
     )
 
-    # Validace připojení
+    # Validace ENV
     missing = []
-    if not IN_CONN_STR:  missing.append("INPUT_BLOB_CONNECTION_STRING")
-    if not OUT_CONN_STR: missing.append("OUTPUT_BLOB_CONNECTION_STRING")
-    if not IN_CONTAINER:  missing.append("INPUT_CONTAINER")
-    if not OUT_CONTAINER: missing.append("OUTPUT_CONTAINER")
+    if not INPUT_ACCOUNT_NAME:  missing.append("INPUT_ACCOUNT_NAME")
+    if not OUTPUT_ACCOUNT_NAME: missing.append("OUTPUT_ACCOUNT_NAME")
+    if not IN_CONTAINER:        missing.append("INPUT_CONTAINER")
+    if not OUT_CONTAINER:       missing.append("OUTPUT_CONTAINER")
     if missing:
         logging.error(f"[{func_name}] Chybí App Settings: {', '.join(missing)}")
         return
 
-    # Blob klienti
+    # Managed Identity credential
     try:
-        in_client  = BlobServiceClient.from_connection_string(IN_CONN_STR)
-        out_client = BlobServiceClient.from_connection_string(OUT_CONN_STR)
+        credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
     except Exception:
-        logging.exception(f"[{func_name}] Nelze vytvořit BlobServiceClient – zkontroluj connection stringy.")
+        logging.exception(f"[{func_name}] Nelze inicializovat DefaultAzureCredential.")
+        return
+
+    # Blob klienti (account_url + MI)
+    in_url  = f"https://{INPUT_ACCOUNT_NAME}.blob.core.windows.net"
+    out_url = f"https://{OUTPUT_ACCOUNT_NAME}.blob.core.windows.net"
+    try:
+        in_client  = BlobServiceClient(account_url=in_url,  credential=credential)
+        out_client = BlobServiceClient(account_url=out_url, credential=credential)
+    except Exception:
+        logging.exception(f"[{func_name}] Nelze vytvořit BlobServiceClient (Managed Identity).")
         return
 
     in_container_client  = in_client.get_container_client(IN_CONTAINER)
@@ -415,7 +402,8 @@ def main(myTimer):
         blobs = list(in_container_client.list_blobs())
         logging.info(f"[{func_name}] Nalezeno {len(blobs)} objektů v '{IN_CONTAINER}'.")
     except Exception:
-        logging.exception(f"[{func_name}] Chyba při listování blobů v '{IN_CONTAINER}'.")
+        logging.exception(f"[{func_name}] Chyba při listování blobů v '{IN_CONTAINER}'. "
+                          f"Ověř, že MI má roli 'Storage Blob Data Reader' / 'Contributor'.")
         return
 
     # 2) Spočítej nové řádky
@@ -448,7 +436,7 @@ def main(myTimer):
         logging.warning(f"[{func_name}] Nebyly vyprodukovány žádné výsledky (žádné validní páry / žádná CSV).")
         return
 
-    import pandas as pd  # jistota v této scope
+    import pandas as pd
     new_df = pd.DataFrame(new_rows, columns=["pair", "B", "S", "gap_pct", "date", "model", "is_active"])
 
     # 3) Zapiš denní snapshot
@@ -460,7 +448,8 @@ def main(myTimer):
         )
         logging.info(f"[{func_name}] Zapsán denní snapshot: {OUT_CONTAINER}/{daily_name} ({len(new_df)} řádků).")
     except Exception:
-        logging.exception(f"[{func_name}] Zápis denního snapshotu selhal.")
+        logging.exception(f"[{func_name}] Zápis denního snapshotu selhal. "
+                          f"Ověř, že MI má roli 'Storage Blob Data Contributor' na výstupním účtu.")
 
     # 4) Master CSV – vždy jen jeden aktivní záznam na (pair, model)
     master_cols = ["pair", "B", "S", "gap_pct", "date", "model", "is_active"]
@@ -469,7 +458,6 @@ def main(myTimer):
         if master_blob.exists():
             master_bytes = master_blob.download_blob().readall()
             master_df = pd.read_csv(io.BytesIO(master_bytes))
-            # doplň chybějící sloupce
             for c in master_cols:
                 if c not in master_df.columns:
                     master_df[c] = False if c == "is_active" else None
