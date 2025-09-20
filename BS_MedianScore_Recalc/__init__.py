@@ -28,15 +28,14 @@ def _get_env_int(name: str, default: int) -> int:
 # ============ Parametry ============
 N_DAYS = _get_env_int("N_DAYS", 20)
 MIN_DAYS_REQUIRED = _get_env_int("MIN_DAYS_REQUIRED", 12)
-COSTS_PCT = _get_env_float("COSTS_PCT", 0.001)     # 0.001 = 0.1 %
+COSTS_PCT = _get_env_float("COSTS_PCT", 0.001)     # 0.001 = 0.1 % na cyklus
 GAP_MIN_PCT = _get_env_float("GAP_MIN_PCT", 0.003) # 0.003 = 0.3 %
 
 PEAKS_K = 60
 MODEL_NAME = "BS_MedianScore"
 
-# Storage přes connection string
-IN_CONN_STR  = os.getenv("INPUT_BLOB_CONNECTION_STRING")
-OUT_CONN_STR = os.getenv("OUTPUT_BLOB_CONNECTION_STRING")
+# Storage: použijeme jediný built-in connection string
+WEBJOBS_CONN = os.getenv("AzureWebJobsStorage")  # <<<<
 IN_CONTAINER  = os.getenv("INPUT_CONTAINER", "market-data")
 OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
 
@@ -326,27 +325,21 @@ def main(myTimer):
         f"IN_CONTAINER={IN_CONTAINER} OUT_CONTAINER={OUT_CONTAINER}"
     )
 
-    missing = []
-    if not IN_CONN_STR:  missing.append("INPUT_BLOB_CONNECTION_STRING")
-    if not OUT_CONN_STR: missing.append("OUTPUT_BLOB_CONNECTION_STRING")
-    if not IN_CONTAINER: missing.append("INPUT_CONTAINER")
-    if not OUT_CONTAINER: missing.append("OUTPUT_CONTAINER")
-    if missing:
-        logging.error(f"[{func_name}] Chybí App Settings: {', '.join(missing)}")
+    if not WEBJOBS_CONN:
+        logging.error(f"[{func_name}] Chybí App Setting 'AzureWebJobsStorage'.")
         return
 
-    # Blob klienti
+    # Jeden BlobServiceClient pro input i output (stejný účet)
     try:
-        in_client  = BlobServiceClient.from_connection_string(IN_CONN_STR)
-        out_client = BlobServiceClient.from_connection_string(OUT_CONN_STR)
+        blob_service = BlobServiceClient.from_connection_string(WEBJOBS_CONN)
     except Exception:
-        logging.exception(f"[{func_name}] Nelze vytvořit BlobServiceClient – zkontroluj connection stringy.")
+        logging.exception(f"[{func_name}] Nelze vytvořit BlobServiceClient z AzureWebJobsStorage.")
         return
 
-    in_container_client  = in_client.get_container_client(IN_CONTAINER)
-    out_container_client = out_client.get_container_client(OUT_CONTAINER)
+    in_container_client  = blob_service.get_container_client(IN_CONTAINER)
+    out_container_client = blob_service.get_container_client(OUT_CONTAINER)
 
-    # vytvoř výstupní container (pokud neexistuje)
+    # Vytvoř výstupní container (pokud neexistuje)
     try:
         out_container_client.create_container()
     except Exception:
