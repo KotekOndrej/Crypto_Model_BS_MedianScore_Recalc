@@ -35,7 +35,7 @@ PEAKS_K = 60
 MODEL_NAME = "BS_MedianScore"
 
 # Storage: použijeme jediný built-in connection string
-WEBJOBS_CONN = os.getenv("AzureWebJobsStorage")  # <<<<
+WEBJOBS_CONN = os.getenv("AzureWebJobsStorage")
 IN_CONTAINER  = os.getenv("INPUT_CONTAINER", "market-data")
 OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
 
@@ -205,6 +205,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
                 hist[i0:i1] += 1.0
         return hist
 
+    # --- load ---
     df = pd.read_csv(io.BytesIO(csv_bytes))
     required = {"closeTimeISO", "low", "high"}
     if not required.issubset(df.columns):
@@ -224,23 +225,26 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         sub = df[df["date"] == d]
         L = sub["low"].to_numpy(dtype=float)
         H = sub["high"].to_numpy(dtype=float)
-        if len(L) == 0: continue
-        history.append((L, H))
+        if len(L) == 0:
+            continue
+        history.append((L, H, d))
     if len(history) < MIN_DAYS_REQUIRED:
         return None
 
-    p_min = min(float(l.min()) for l, _ in history)
-    p_max = max(float(h.max()) for _, h in history)
+    # --- histogram ---
+    p_min = min(float(l.min()) for l, _, _ in history)
+    p_max = max(float(h.max()) for _, h, _ in history)
     bins = _make_bins(p_min, p_max, n_bins=600)
     hist = np.zeros(len(bins) - 1, dtype=float)
-    for L, H in history:
+    for L, H, _ in history:
         hist += _build_touch_hist_day(L, H, bins)
     hist_smooth = _gaussian_smooth(hist, sigma_bins=3)
 
-    daily_closes = [float(np.mean((L + H) / 2)) for (L, H) in history]
-    daily_opens  = [float((L[0] + H[0]) / 2)    for (L, H) in history]
-    daily_highs  = [float(H.max())              for (_, H) in history]
-    daily_lows   = [float(L.min())              for (L, _) in history]
+    # --- daily proxies + features for side selection ---
+    daily_closes = [float(np.mean((L + H) / 2)) for (L, H, _) in history]
+    daily_opens  = [float((L[0] + H[0]) / 2)    for (L, H, _) in history]
+    daily_highs  = [float(H.max())              for (_, H, _) in history]
+    daily_lows   = [float(L.min())              for (L, _, _) in history]
 
     closes = np.array(daily_closes, dtype=float)
     opens  = np.array(daily_opens, dtype=float)
@@ -258,10 +262,11 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         p_up = predict_proba_logreg(w, X[-1])
         side = "long" if p_up >= 0.6 else "short" if p_up <= 0.4 else "both"
 
+    # --- candidates from peaks (only min gap rule) ---
     peak_idx = find_local_peaks(hist_smooth, k_peaks=PEAKS_K, min_separation=2)
     levels = [bin_center(bins, i) for i in peak_idx]
     current_price = closes[-1]
-    avg_price = float(np.mean([np.mean((L + H) / 2) for (L, H) in history]))
+    avg_price = float(np.mean([np.mean((L + H) / 2) for (L, H, _) in history]))
     min_gap_abs = GAP_MIN_PCT * avg_price
 
     lower = sorted([lv for lv in levels if lv <= current_price], key=lambda x: abs(x - current_price))[:12]
@@ -274,34 +279,52 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         if not pairs:
             return None
 
-    best = None
-    for (B, S) in pairs:
+    # --- evaluate candidates across the window ---
+    def eval_pair(B, S):
         costs_abs = COSTS_PCT * ((B + S) / 2.0)
         pnls = []
-        for L, H in history:
-            p, _ = simulate_day_no_timeout_side(B, S, L, H, costs_abs=costs_abs, side=side)
+        cycles = []
+        for L, H, _ in history:
+            p, c = simulate_day_no_timeout_side(B, S, L, H, costs_abs=costs_abs, side=side)
             pnls.append(p)
-        import numpy as np
+            cycles.append(c)
         pnls = np.array(pnls, dtype=float)
         med = float(np.median(pnls))
         iqr = float(np.percentile(pnls, 75) - np.percentile(pnls, 25))
         score = med - 0.25 * iqr
-        cand = (score, B, S)
-        if (best is None) or (cand > best):
-            best = cand
+        total_cycles = int(np.sum(cycles))
+        gap_pct = (S - B) / max(B, 1e-12)
+        dist = abs(((B + S) / 2) - current_price) / max(current_price, 1e-12)
+        return total_cycles, score, gap_pct, dist
 
-    if not best:
+    best = None
+    best_metrics = None
+    for (B, S) in pairs:
+        met = eval_pair(B, S)  # (cycles, score, gap_pct, dist)
+        if best is None:
+            best = (B, S)
+            best_metrics = met
+            continue
+        # Primárně: více cyklů; pak vyšší MedianScore; pak menší gap; pak blíž k aktuální ceně
+        if (met[0], met[1], -met[2], -met[3]) > (best_metrics[0], best_metrics[1], -best_metrics[2], -best_metrics[3]):
+            best = (B, S)
+            best_metrics = met
+
+    if best is None:
         return None
 
-    _, bestB, bestS = best
-    gap_pct = 100.0 * (bestS - bestB) / max(bestB, 1e-12)
+    bestB, bestS = best
+    total_cycles, score, gap_pct, _ = best_metrics
+    gap_pct *= 100.0
 
     return {
         "pair": pair_name,
         "B": bestB,
         "S": bestS,
         "gap_pct": gap_pct,
-        "model": MODEL_NAME
+        "model": MODEL_NAME,
+        "total_cycles": total_cycles,
+        "score": score
     }
 
 # ============ ENTRYPOINT ============
@@ -329,7 +352,6 @@ def main(myTimer):
         logging.error(f"[{func_name}] Chybí App Setting 'AzureWebJobsStorage'.")
         return
 
-    # Jeden BlobServiceClient pro input i output (stejný účet)
     try:
         blob_service = BlobServiceClient.from_connection_string(WEBJOBS_CONN)
     except Exception:
@@ -338,14 +360,11 @@ def main(myTimer):
 
     in_container_client  = blob_service.get_container_client(IN_CONTAINER)
     out_container_client = blob_service.get_container_client(OUT_CONTAINER)
-
-    # Vytvoř výstupní container (pokud neexistuje)
     try:
         out_container_client.create_container()
     except Exception:
         pass
 
-    # 1) Načti vstupní CSV soubory
     try:
         blobs = list(in_container_client.list_blobs())
         logging.info(f"[{func_name}] Nalezeno {len(blobs)} objektů v '{IN_CONTAINER}'.")
@@ -353,7 +372,6 @@ def main(myTimer):
         logging.exception(f"[{func_name}] Chyba při listování blobů v '{IN_CONTAINER}'")
         return
 
-    # 2) Spočítej nové řádky
     new_rows = []
     for blob in blobs:
         if not blob.name.lower().endswith(".csv"):
@@ -372,9 +390,11 @@ def main(myTimer):
                 "gap_pct": float(res["gap_pct"]),
                 "date": date_str,
                 "model": res["model"],
-                "is_active": True
+                "is_active": True,
+                "total_cycles": int(res.get("total_cycles", 0)),
+                "score": float(res.get("score", 0.0)),
             })
-            logging.info(f"[{func_name}] OK {pair_name}: B={res['B']:.6f}, S={res['S']:.6f}, gap={res['gap_pct']:.3f}%")
+            logging.info(f"[{func_name}] OK {pair_name}: B={res['B']:.6f}, S={res['S']:.6f}, gap={res['gap_pct']:.3f}%, cycles={int(res.get('total_cycles',0))}")
         except Exception:
             logging.exception(f"[{func_name}] Chyba při zpracování {blob.name}")
             continue
@@ -383,7 +403,7 @@ def main(myTimer):
         logging.warning(f"[{func_name}] Nebyly vyprodukovány žádné výsledky.")
         return
 
-    new_df = pd.DataFrame(new_rows, columns=["pair", "B", "S", "gap_pct", "date", "model", "is_active"])
+    new_df = pd.DataFrame(new_rows, columns=["pair", "B", "S", "gap_pct", "date", "model", "is_active", "total_cycles", "score"])
 
     # 3) Zapiš denní snapshot
     daily_name = f"{DAILY_PREFIX}{date_str}.csv"
@@ -395,19 +415,17 @@ def main(myTimer):
         logging.info(f"[{func_name}] Zapsán denní snapshot: {OUT_CONTAINER}/{daily_name} ({len(new_df)} řádků).")
     except Exception:
         logging.exception(f"[{func_name}] Zápis denního snapshotu selhal.")
-        # pokračujeme k masteru i tak
 
     # 4) Master CSV – vždy jen jeden aktivní záznam na (pair, model)
-    master_cols = ["pair", "B", "S", "gap_pct", "date", "model", "is_active"]
+    master_cols = ["pair", "B", "S", "gap_pct", "date", "model", "is_active", "total_cycles", "score"]
     try:
         master_blob = out_container_client.get_blob_client(MASTER_CSV_NAME)
         if master_blob.exists():
             master_bytes = master_blob.download_blob().readall()
             master_df = pd.read_csv(io.BytesIO(master_bytes))
-            # doplň chybějící sloupce a pořadí
             for c in master_cols:
                 if c not in master_df.columns:
-                    master_df[c] = False if c == "is_active" else None
+                    master_df[c] = 0 if c in ("total_cycles", "score") else (False if c == "is_active" else None)
             master_df = master_df[master_cols]
         else:
             master_df = pd.DataFrame(columns=master_cols)
