@@ -294,14 +294,17 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         iqr = float(np.percentile(pnls, 75) - np.percentile(pnls, 25))
         score = med - 0.25 * iqr
         total_cycles = int(np.sum(cycles))
+        base = max(((B + S) / 2.0), 1e-12)
+        avg_pnl_pct = float(np.mean(pnls) / base) * 100.0
+        median_pnl_pct = float(med / base) * 100.0
         gap_pct = (S - B) / max(B, 1e-12)
         dist = abs(((B + S) / 2) - current_price) / max(current_price, 1e-12)
-        return total_cycles, score, gap_pct, dist
+        return total_cycles, score, gap_pct, dist, avg_pnl_pct, median_pnl_pct
 
     best = None
     best_metrics = None
     for (B, S) in pairs:
-        met = eval_pair(B, S)  # (cycles, score, gap_pct, dist)
+        met = eval_pair(B, S)  # (cycles, score, gap_pct, dist, avg_pnl_pct, median_pnl_pct)
         if best is None:
             best = (B, S)
             best_metrics = met
@@ -315,7 +318,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         return None
 
     bestB, bestS = best
-    total_cycles, score, gap_pct, _ = best_metrics
+    total_cycles, score, gap_pct, _, avg_pnl_pct, median_pnl_pct = best_metrics
     gap_pct *= 100.0
 
     return {
@@ -325,7 +328,9 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         "gap_pct": gap_pct,
         "model": MODEL_NAME,
         "total_cycles": total_cycles,
-        "score": score
+        "score": score,
+        "avg_pnl_pct": avg_pnl_pct,
+        "median_pnl_pct": median_pnl_pct
     }
 
 # ============ ENTRYPOINT ============
@@ -395,11 +400,14 @@ def main(myTimer):
                 "is_active": True,
                 "total_cycles": int(res.get("total_cycles", 0)),
                 "score": float(res.get("score", 0.0)),
-                "load_time_utc": load_time  # <── nový sloupec
+                "avg_pnl_pct": float(res.get("avg_pnl_pct", 0.0)),
+                "median_pnl_pct": float(res.get("median_pnl_pct", 0.0)),
+                "load_time_utc": load_time
             })
             logging.info(
                 f"[{func_name}] OK {pair_name}: B={res['B']:.6f}, S={res['S']:.6f}, "
-                f"gap={res['gap_pct']:.3f}%, cycles={int(res.get('total_cycles',0))}"
+                f"gap={res['gap_pct']:.3f}%, cycles={int(res.get('total_cycles',0))}, "
+                f"avg_pnl={float(res.get('avg_pnl_pct',0.0)):.3f}%"
             )
         except Exception:
             logging.exception(f"[{func_name}] Chyba při zpracování {blob.name}")
@@ -410,7 +418,8 @@ def main(myTimer):
         return
 
     import pandas as pd
-    cols = ["pair","B","S","gap_pct","date","model","is_active","total_cycles","score","load_time_utc"]
+    cols = ["pair","B","S","gap_pct","date","model","is_active",
+            "total_cycles","score","avg_pnl_pct","median_pnl_pct","load_time_utc"]
     new_df = pd.DataFrame(new_rows, columns=cols)
 
     # 3) Zapiš denní snapshot (přepis souboru pro dnešní den)
