@@ -34,7 +34,7 @@ GAP_MIN_PCT = _get_env_float("GAP_MIN_PCT", 0.003) # 0.003 = 0.3 %
 PEAKS_K = 60
 MODEL_NAME = "BS_MedianScore"
 
-# Storage: použijeme jediný built-in connection string
+# Storage: použijeme built-in connection string (jeden účet pro input i output)
 WEBJOBS_CONN = os.getenv("AzureWebJobsStorage")
 IN_CONTAINER  = os.getenv("INPUT_CONTAINER", "market-data")
 OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
@@ -42,7 +42,7 @@ OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
 MASTER_CSV_NAME = "bs_levels_master.csv"
 DAILY_PREFIX    = "bs_levels_"
 
-# ============ Utility funkce ============
+# ============ Utility ============
 def extract_pair_from_filename(blob_name: str) -> str:
     base = os.path.splitext(os.path.basename(blob_name))[0]
     for sep in ['_', '-']:
@@ -73,19 +73,19 @@ def simulate_day_no_timeout_side(B, S, L, H, costs_abs=0.0, side="both"):
     cycles = 0
     pos = 0
     for (l, h) in zip(L, H):
-        touched_B = (l <= B <= h)
-        touched_S = (l <= S <= h)
+        tb = (l <= B <= h)
+        ts = (l <= S <= h)
         if pos == 0:
-            if side in ("both", "long") and touched_B:
+            if side in ("both", "long") and tb:
                 pos = +1
-            elif side in ("both", "short") and touched_S:
+            elif side in ("both", "short") and ts:
                 pos = -1
         else:
-            if pos == +1 and touched_S:
+            if pos == +1 and ts:
                 pnl += (S - B) - costs_abs
                 pos = 0
                 cycles += 1
-            elif pos == -1 and touched_B:
+            elif pos == -1 and tb:
                 pnl += (S - B) - costs_abs
                 pos = 0
                 cycles += 1
@@ -246,6 +246,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
     daily_highs  = [float(H.max())              for (_, H, _) in history]
     daily_lows   = [float(L.min())              for (L, _, _) in history]
 
+    import numpy as np
     closes = np.array(daily_closes, dtype=float)
     opens  = np.array(daily_opens, dtype=float)
     highs  = np.array(daily_highs, dtype=float)
@@ -262,7 +263,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         p_up = predict_proba_logreg(w, X[-1])
         side = "long" if p_up >= 0.6 else "short" if p_up <= 0.4 else "both"
 
-    # --- candidates from peaks (only min gap rule) ---
+    # --- candidates from peaks (min gap rule; primárně max počet cyklů) ---
     peak_idx = find_local_peaks(hist_smooth, k_peaks=PEAKS_K, min_separation=2)
     levels = [bin_center(bins, i) for i in peak_idx]
     current_price = closes[-1]
@@ -279,7 +280,6 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         if not pairs:
             return None
 
-    # --- evaluate candidates across the window ---
     def eval_pair(B, S):
         costs_abs = COSTS_PCT * ((B + S) / 2.0)
         pnls = []
@@ -288,6 +288,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
             p, c = simulate_day_no_timeout_side(B, S, L, H, costs_abs=costs_abs, side=side)
             pnls.append(p)
             cycles.append(c)
+        import numpy as np
         pnls = np.array(pnls, dtype=float)
         med = float(np.median(pnls))
         iqr = float(np.percentile(pnls, 75) - np.percentile(pnls, 25))
@@ -339,6 +340,7 @@ def main(myTimer):
 
     now_utc = datetime.now(timezone.utc)
     date_str = now_utc.strftime("%Y-%m-%d")
+    load_time = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     func_name = "BSMedianScoreRecalc"
 
     logging.info(
@@ -393,8 +395,12 @@ def main(myTimer):
                 "is_active": True,
                 "total_cycles": int(res.get("total_cycles", 0)),
                 "score": float(res.get("score", 0.0)),
+                "load_time_utc": load_time  # <── nový sloupec
             })
-            logging.info(f"[{func_name}] OK {pair_name}: B={res['B']:.6f}, S={res['S']:.6f}, gap={res['gap_pct']:.3f}%, cycles={int(res.get('total_cycles',0))}")
+            logging.info(
+                f"[{func_name}] OK {pair_name}: B={res['B']:.6f}, S={res['S']:.6f}, "
+                f"gap={res['gap_pct']:.3f}%, cycles={int(res.get('total_cycles',0))}"
+            )
         except Exception:
             logging.exception(f"[{func_name}] Chyba při zpracování {blob.name}")
             continue
@@ -403,9 +409,11 @@ def main(myTimer):
         logging.warning(f"[{func_name}] Nebyly vyprodukovány žádné výsledky.")
         return
 
-    new_df = pd.DataFrame(new_rows, columns=["pair", "B", "S", "gap_pct", "date", "model", "is_active", "total_cycles", "score"])
+    import pandas as pd
+    cols = ["pair","B","S","gap_pct","date","model","is_active","total_cycles","score","load_time_utc"]
+    new_df = pd.DataFrame(new_rows, columns=cols)
 
-    # 3) Zapiš denní snapshot
+    # 3) Zapiš denní snapshot (přepis souboru pro dnešní den)
     daily_name = f"{DAILY_PREFIX}{date_str}.csv"
     try:
         out_container_client.get_blob_client(daily_name).upload_blob(
@@ -416,8 +424,8 @@ def main(myTimer):
     except Exception:
         logging.exception(f"[{func_name}] Zápis denního snapshotu selhal.")
 
-    # 4) Master CSV – vždy jen jeden aktivní záznam na (pair, model)
-    master_cols = ["pair", "B", "S", "gap_pct", "date", "model", "is_active", "total_cycles", "score"]
+    # 4) Master CSV – ponecháme historii; zneaktivníme staré aktivní záznamy pro stejné (pair, model)
+    master_cols = cols
     try:
         master_blob = out_container_client.get_blob_client(MASTER_CSV_NAME)
         if master_blob.exists():
@@ -425,7 +433,7 @@ def main(myTimer):
             master_df = pd.read_csv(io.BytesIO(master_bytes))
             for c in master_cols:
                 if c not in master_df.columns:
-                    master_df[c] = 0 if c in ("total_cycles", "score") else (False if c == "is_active" else None)
+                    master_df[c] = None
             master_df = master_df[master_cols]
         else:
             master_df = pd.DataFrame(columns=master_cols)
@@ -433,7 +441,6 @@ def main(myTimer):
         logging.exception(f"[{func_name}] Chyba při načtení master CSV – vytvořím nový.")
         master_df = pd.DataFrame(columns=master_cols)
 
-    # deaktivuj staré aktivní pro stejné (pair, model)
     if not master_df.empty:
         for _, row in new_df.iterrows():
             mask = (
@@ -444,10 +451,8 @@ def main(myTimer):
             if mask.any():
                 master_df.loc[mask, "is_active"] = False
 
-    # přidej nové aktivní řádky
     master_df = pd.concat([master_df, new_df], ignore_index=True)
 
-    # ulož master zpět
     try:
         out_container_client.get_blob_client(MASTER_CSV_NAME).upload_blob(
             master_df.to_csv(index=False).encode("utf-8"),
