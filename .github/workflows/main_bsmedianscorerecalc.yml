@@ -14,7 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,14 +28,17 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # OFFLINE BUILD: nainstalujeme balíčky do .python_packages/lib/site-packages
+      # 🔧 Začni na čisto a nainstaluj závislosti do .python_packages
       - name: Install dependencies into .python_packages
         run: |
+          rm -rf .python_packages
           python -m pip install --upgrade pip
           mkdir -p .python_packages/lib/site-packages
+          # nejdřív kompatibilní cryptography (kvůli GLIBC)
+          pip install "cryptography==41.0.7" -t .python_packages/lib/site-packages
+          # pak zbytek dle requirements
           pip install -r requirements.txt -t .python_packages/lib/site-packages
 
-      # Zabalíme repozitář vč. .python_packages (vynecháme venv, .git, atd.)
       - name: Zip artifact for deployment (including .python_packages)
         run: |
           zip -r release.zip . \
@@ -76,3 +78,4 @@ jobs:
           slot-name: 'Production'
           package: release.zip                     # nasazujeme připravený zip
           # server-side build není potřeba (balíčky už jsou v .python_packages)
+
