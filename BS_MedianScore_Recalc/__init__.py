@@ -246,7 +246,6 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
     daily_highs  = [float(H.max())              for (_, H, _) in history]
     daily_lows   = [float(L.min())              for (L, _, _) in history]
 
-    import numpy as np
     closes = np.array(daily_closes, dtype=float)
     opens  = np.array(daily_opens, dtype=float)
     highs  = np.array(daily_highs, dtype=float)
@@ -258,6 +257,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
 
     if len(y) < 5:
         side = "both"
+        p_up = 0.5
     else:
         w = logistic_regression_irls(X[:-1], y[:-1])
         p_up = predict_proba_logreg(w, X[-1])
@@ -279,6 +279,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         pairs = [(B, S) for B in lower for S in upper if (S - B) >= min_gap_abs]
         if not pairs:
             return None
+    n_candidates = len(pairs)
 
     def eval_pair(B, S):
         costs_abs = COSTS_PCT * ((B + S) / 2.0)
@@ -288,7 +289,6 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
             p, c = simulate_day_no_timeout_side(B, S, L, H, costs_abs=costs_abs, side=side)
             pnls.append(p)
             cycles.append(c)
-        import numpy as np
         pnls = np.array(pnls, dtype=float)
         med = float(np.median(pnls))
         iqr = float(np.percentile(pnls, 75) - np.percentile(pnls, 25))
@@ -318,8 +318,24 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         return None
 
     bestB, bestS = best
-    total_cycles, score, gap_pct, _, avg_pnl_pct, median_pnl_pct = best_metrics
+    total_cycles, score, gap_pct, dist_rel, avg_pnl_pct, median_pnl_pct = best_metrics
     gap_pct *= 100.0
+    costs_abs = COSTS_PCT * ((bestB + bestS) / 2.0)
+
+    # detailní metriky pro best pár (pro zápis)
+    pnls = []
+    day_cycles = []
+    for L, H, _ in history:
+        p, c = simulate_day_no_timeout_side(bestB, bestS, L, H, costs_abs=costs_abs, side=side)
+        pnls.append(p); day_cycles.append(c)
+    import numpy as np as _np  # keep local alias separate (optional)
+    pnls_arr = _np.array(pnls, dtype=float)
+    iqr_pnl = float(_np.percentile(pnls_arr, 75) - _np.percentile(pnls_arr, 25))
+    std_pnl = float(_np.std(pnls_arr))
+    pnl_p05 = float(_np.percentile(pnls_arr, 5))
+    pnl_p95 = float(_np.percentile(pnls_arr, 95))
+    hit_rate_days = int(_np.sum(_np.array(day_cycles) > 0))
+    dist_to_price = float(dist_rel)  # relativní vzdálenost od aktuální ceny
 
     return {
         "pair": pair_name,
@@ -330,13 +346,25 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         "total_cycles": total_cycles,
         "score": score,
         "avg_pnl_pct": avg_pnl_pct,
-        "median_pnl_pct": median_pnl_pct
+        "median_pnl_pct": median_pnl_pct,
+        # NOVÉ METRIKY PRO ZÁPIS
+        "side": side,
+        "p_up": float(p_up),
+        "iqr_pnl": iqr_pnl,
+        "std_pnl": std_pnl,
+        "pnl_p05": pnl_p05,
+        "pnl_p95": pnl_p95,
+        "hit_rate_days": hit_rate_days,
+        "dist_to_price": dist_to_price,
+        "min_gap_abs": float(min_gap_abs),
+        "costs_abs": float(costs_abs),
+        "n_candidates": int(n_candidates)
     }
 
 # ============ ENTRYPOINT ============
 def main(myTimer):
     try:
-        import numpy as np
+        import numpy as np  # noqa: F401
         import pandas as pd
         from azure.storage.blob import BlobServiceClient
     except Exception:
@@ -402,12 +430,25 @@ def main(myTimer):
                 "score": float(res.get("score", 0.0)),
                 "avg_pnl_pct": float(res.get("avg_pnl_pct", 0.0)),
                 "median_pnl_pct": float(res.get("median_pnl_pct", 0.0)),
-                "load_time_utc": load_time
+                "load_time_utc": load_time,
+                # NOVÉ METRIKY
+                "side": res.get("side"),
+                "p_up": float(res.get("p_up", 0.5)),
+                "iqr_pnl": float(res.get("iqr_pnl", 0.0)),
+                "std_pnl": float(res.get("std_pnl", 0.0)),
+                "pnl_p05": float(res.get("pnl_p05", 0.0)),
+                "pnl_p95": float(res.get("pnl_p95", 0.0)),
+                "hit_rate_days": int(res.get("hit_rate_days", 0)),
+                "dist_to_price": float(res.get("dist_to_price", 0.0)),
+                "min_gap_abs": float(res.get("min_gap_abs", 0.0)),
+                "costs_abs": float(res.get("costs_abs", 0.0)),
+                "n_candidates": int(res.get("n_candidates", 0)),
             })
             logging.info(
                 f"[{func_name}] OK {pair_name}: B={res['B']:.6f}, S={res['S']:.6f}, "
                 f"gap={res['gap_pct']:.3f}%, cycles={int(res.get('total_cycles',0))}, "
-                f"avg_pnl={float(res.get('avg_pnl_pct',0.0)):.3f}%"
+                f"avg_pnl={float(res.get('avg_pnl_pct',0.0)):.3f}%, side={res.get('side')} "
+                f"(p_up={float(res.get('p_up',0.5)):.3f}), iqr={float(res.get('iqr_pnl',0.0)):.6f}"
             )
         except Exception:
             logging.exception(f"[{func_name}] Chyba při zpracování {blob.name}")
@@ -419,10 +460,15 @@ def main(myTimer):
 
     import pandas as pd
     cols = ["pair","B","S","gap_pct","date","model","is_active",
-            "total_cycles","score","avg_pnl_pct","median_pnl_pct","load_time_utc"]
+            "total_cycles","score","avg_pnl_pct","median_pnl_pct","load_time_utc",
+            # NOVÉ
+            "side","p_up","iqr_pnl","std_pnl","pnl_p05","pnl_p95",
+            "hit_rate_days","dist_to_price","min_gap_abs","costs_abs","n_candidates"]
     new_df = pd.DataFrame(new_rows, columns=cols)
 
     # 3) Zapiš denní snapshot (přepis souboru pro dnešní den)
+    daily_name = f"{DAILY_PREFIX}{date_str}.csv}"
+    # Fix: bez překlepu v názvu
     daily_name = f"{DAILY_PREFIX}{date_str}.csv"
     try:
         out_container_client.get_blob_client(daily_name).upload_blob(
