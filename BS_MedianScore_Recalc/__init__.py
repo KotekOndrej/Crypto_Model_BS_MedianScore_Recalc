@@ -328,7 +328,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
     for L, H, _ in history:
         p, c = simulate_day_no_timeout_side(bestB, bestS, L, H, costs_abs=costs_abs, side=side)
         pnls.append(p); day_cycles.append(c)
-    import numpy as np as _np  # keep local alias separate (optional)
+    import numpy as _np  # keep local alias separate (optional)
     pnls_arr = _np.array(pnls, dtype=float)
     iqr_pnl = float(_np.percentile(pnls_arr, 75) - _np.percentile(pnls_arr, 25))
     std_pnl = float(_np.std(pnls_arr))
