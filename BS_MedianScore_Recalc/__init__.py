@@ -498,8 +498,8 @@ def main(myTimer):
         for _, row in new_df.iterrows():
             mask = (
                 (master_df["pair"] == row["pair"]) &
-                (master_df["model"] == row["model"]) &
-                (master_df["is_active"] == True)
+                (master_df["model"] == MODEL_NAME) &   # <- explicitně jen BS_MedianScore
+                (master_df["is_active"] == True)    
             )
             if mask.any():
                 master_df.loc[mask, "is_active"] = False
