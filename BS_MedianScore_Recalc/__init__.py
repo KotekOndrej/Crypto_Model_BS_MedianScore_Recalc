@@ -28,13 +28,13 @@ def _get_env_int(name: str, default: int) -> int:
 # ============ Parametry ============
 N_DAYS = _get_env_int("N_DAYS", 20)
 MIN_DAYS_REQUIRED = _get_env_int("MIN_DAYS_REQUIRED", 12)
-COSTS_PCT = _get_env_float("COSTS_PCT", 0.001)     # 0.001 = 0.1 % na cyklus
-GAP_MIN_PCT = _get_env_float("GAP_MIN_PCT", 0.003) # 0.003 = 0.3 %
+COSTS_PCT = _get_env_float("COSTS_PCT", 0.001)     # 0.1 % na cyklus
+GAP_MIN_PCT = _get_env_float("GAP_MIN_PCT", 0.003) # 0.3 %
 
 PEAKS_K = 60
 MODEL_NAME = "BS_MedianScore"
 
-# Storage: použijeme built-in connection string (jeden účet pro input i output)
+# Storage
 WEBJOBS_CONN = os.getenv("AzureWebJobsStorage")
 IN_CONTAINER  = os.getenv("INPUT_CONTAINER", "market-data")
 OUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "market-signals")
@@ -263,7 +263,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         p_up = predict_proba_logreg(w, X[-1])
         side = "long" if p_up >= 0.6 else "short" if p_up <= 0.4 else "both"
 
-    # --- candidates from peaks (min gap rule; primárně max počet cyklů) ---
+    # --- candidates ---
     peak_idx = find_local_peaks(hist_smooth, k_peaks=PEAKS_K, min_separation=2)
     levels = [bin_center(bins, i) for i in peak_idx]
     current_price = closes[-1]
@@ -304,12 +304,11 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
     best = None
     best_metrics = None
     for (B, S) in pairs:
-        met = eval_pair(B, S)  # (cycles, score, gap_pct, dist, avg_pnl_pct, median_pnl_pct)
+        met = eval_pair(B, S)
         if best is None:
             best = (B, S)
             best_metrics = met
             continue
-        # Primárně: více cyklů; pak vyšší MedianScore; pak menší gap; pak blíž k aktuální ceně
         if (met[0], met[1], -met[2], -met[3]) > (best_metrics[0], best_metrics[1], -best_metrics[2], -best_metrics[3]):
             best = (B, S)
             best_metrics = met
@@ -322,20 +321,23 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
     gap_pct *= 100.0
     costs_abs = COSTS_PCT * ((bestB + bestS) / 2.0)
 
-    # detailní metriky pro best pár (pro zápis)
+    # detailní metriky pro best pár
     pnls = []
     day_cycles = []
     for L, H, _ in history:
         p, c = simulate_day_no_timeout_side(bestB, bestS, L, H, costs_abs=costs_abs, side=side)
-        pnls.append(p); day_cycles.append(c)
-    import numpy as _np  # keep local alias separate (optional)
-    pnls_arr = _np.array(pnls, dtype=float)
-    iqr_pnl = float(_np.percentile(pnls_arr, 75) - _np.percentile(pnls_arr, 25))
-    std_pnl = float(_np.std(pnls_arr))
-    pnl_p05 = float(_np.percentile(pnls_arr, 5))
-    pnl_p95 = float(_np.percentile(pnls_arr, 95))
-    hit_rate_days = int(_np.sum(_np.array(day_cycles) > 0))
-    dist_to_price = float(dist_rel)  # relativní vzdálenost od aktuální ceny
+        pnls.append(p)
+        day_cycles.append(c)
+
+    # použijeme stejné np jako výše (žádné aliasy)
+    import numpy as np  # lokální, už je importované, ale je to bezpečné
+    pnls_arr = np.array(pnls, dtype=float)
+    iqr_pnl = float(np.percentile(pnls_arr, 75) - np.percentile(pnls_arr, 25))
+    std_pnl = float(np.std(pnls_arr))
+    pnl_p05 = float(np.percentile(pnls_arr, 5))
+    pnl_p95 = float(np.percentile(pnls_arr, 95))
+    hit_rate_days = int(np.sum(np.array(day_cycles) > 0))
+    dist_to_price = float(dist_rel)
 
     return {
         "pair": pair_name,
@@ -347,7 +349,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         "score": score,
         "avg_pnl_pct": avg_pnl_pct,
         "median_pnl_pct": median_pnl_pct,
-        # NOVÉ METRIKY PRO ZÁPIS
+        # nové metriky
         "side": side,
         "p_up": float(p_up),
         "iqr_pnl": iqr_pnl,
@@ -358,13 +360,12 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         "dist_to_price": dist_to_price,
         "min_gap_abs": float(min_gap_abs),
         "costs_abs": float(costs_abs),
-        "n_candidates": int(n_candidates)
+        "n_candidates": int(n_candidates),
     }
 
 # ============ ENTRYPOINT ============
 def main(myTimer):
     try:
-        import numpy as np  # noqa: F401
         import pandas as pd
         from azure.storage.blob import BlobServiceClient
     except Exception:
@@ -431,7 +432,7 @@ def main(myTimer):
                 "avg_pnl_pct": float(res.get("avg_pnl_pct", 0.0)),
                 "median_pnl_pct": float(res.get("median_pnl_pct", 0.0)),
                 "load_time_utc": load_time,
-                # NOVÉ METRIKY
+                # nové metriky
                 "side": res.get("side"),
                 "p_up": float(res.get("p_up", 0.5)),
                 "iqr_pnl": float(res.get("iqr_pnl", 0.0)),
@@ -461,14 +462,11 @@ def main(myTimer):
     import pandas as pd
     cols = ["pair","B","S","gap_pct","date","model","is_active",
             "total_cycles","score","avg_pnl_pct","median_pnl_pct","load_time_utc",
-            # NOVÉ
             "side","p_up","iqr_pnl","std_pnl","pnl_p05","pnl_p95",
             "hit_rate_days","dist_to_price","min_gap_abs","costs_abs","n_candidates"]
     new_df = pd.DataFrame(new_rows, columns=cols)
 
-    # 3) Zapiš denní snapshot (přepis souboru pro dnešní den)
-    daily_name = f"{DAILY_PREFIX}{date_str}.csv}"
-    # Fix: bez překlepu v názvu
+    # 3) denní snapshot
     daily_name = f"{DAILY_PREFIX}{date_str}.csv"
     try:
         out_container_client.get_blob_client(daily_name).upload_blob(
@@ -479,7 +477,7 @@ def main(myTimer):
     except Exception:
         logging.exception(f"[{func_name}] Zápis denního snapshotu selhal.")
 
-    # 4) Master CSV – ponecháme historii; zneaktivníme staré aktivní záznamy pro stejné (pair, model)
+    # 4) Master CSV – deaktivace starých aktivních a append nových
     master_cols = cols
     try:
         master_blob = out_container_client.get_blob_client(MASTER_CSV_NAME)
