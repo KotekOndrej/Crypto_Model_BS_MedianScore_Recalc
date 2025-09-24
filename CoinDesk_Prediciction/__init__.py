@@ -13,7 +13,7 @@ from dateutil.relativedelta import relativedelta
 
 # -------------------- Konfigurace --------------------
 COINCIDEX_BASE_URL = "https://coincodex.com/predictions/"
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/1.5)")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/diag-1.0)")
 TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Prague")  # informativní
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # použij storage Function Appu
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
@@ -23,6 +23,8 @@ MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
 # Mapování sloupců na label + funkci výpočtu cílového data
@@ -40,20 +42,9 @@ CSV_HEADER = "scrape_date,symbol,token_name,horizon,model_to,predicted_price,pre
 
 # -------------------- Parser helpery --------------------
 def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-    """
-    Z buňky typu "$ 4,660.39 11.49%" vytáhne:
-      - cenu (Decimal) 4660.39
-      - procentuální změnu (Decimal) 11.49 (může být záporná)
-    Pokud něco chybí, vrací None.
-    """
     if not text:
         return None, None
-
-    # cena: první peněžní číslo (povolíme tisícové čárky)
-    m_price = re.search(
-        r"[-]?\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
-        text
-    )
+    m_price = re.search(r"[-]?\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)", text)
     price_dec: Optional[Decimal] = None
     if m_price:
         num = m_price.group(1).replace(",", "")
@@ -61,8 +52,6 @@ def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decim
             price_dec = Decimal(num)
         except InvalidOperation:
             price_dec = None
-
-    # procento: první výskyt čísla s %
     m_pct = re.search(r"([+\-]?\d+(?:\.\d+)?)\s*%", text)
     pct_dec: Optional[Decimal] = None
     if m_pct:
@@ -70,18 +59,11 @@ def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decim
             pct_dec = Decimal(m_pct.group(1))
         except InvalidOperation:
             pct_dec = None
-
     return price_dec, pct_dec
 
 
 def extract_table_rows(html: str) -> List[Dict]:
-    """
-    Vrací list dictů:
-      { symbol, token_name, pred_5d, chg_5d, pred_1m, chg_1m, ... }
-    """
-    # Použijeme vestavěný parser, abychom se vyhnuli závislosti na lxml
     soup = BeautifulSoup(html, "html.parser")
-
     table = None
     for t in soup.find_all("table"):
         headers = [th.get_text(strip=True) for th in t.find_all("th")]
@@ -108,7 +90,6 @@ def extract_table_rows(html: str) -> List[Dict]:
         if len(tds) < len(header_texts):
             continue
 
-        # Name: typicky "ETH Ethereum"
         name_cell = tds[col_idx["Name"]]
         name_text = name_cell.get_text(" ", strip=True)
         symbol = None
@@ -155,31 +136,35 @@ def extract_table_rows(html: str) -> List[Dict]:
                 "pred_1y": preds.get("1Y Prediction"),
                 "chg_1y": chgs.get("1Y Prediction"),
             })
-
     return rows
 
 
 def fetch_predictions_page(page: Optional[int] = None) -> Optional[str]:
     url = COINCIDEX_BASE_URL if not page or page == 1 else f"{COINCIDEX_BASE_URL}?page={page}"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-    except Exception as e:
-        logging.warning("Request error for %s: %s", url, e)
-        return None
-
-    if resp.status_code != 200:
-        logging.warning("Failed to GET %s -> %s", url, resp.status_code)
-        return None
-    return resp.text
+    # jednoduchý retry (2 pokusy)
+    for attempt in range(1, 3):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=45)
+            logging.info("[fetch] page=%s status=%s len=%s attempt=%s", page or 1, resp.status_code, len(resp.text), attempt)
+            if resp.status_code == 200:
+                return resp.text
+            else:
+                logging.warning("[fetch] Non-200 status for %s: %s", url, resp.status_code)
+        except Exception as e:
+            logging.warning("[fetch] Error on %s (attempt %s): %s", url, attempt, e)
+    return None
 
 
 def iter_all_pages(max_pages: int = MAX_PAGES):
     for p in range(1, max_pages + 1):
         html = fetch_predictions_page(p)
         if not html:
+            logging.info("[pager] No HTML for page %s, stop.", p)
             break
         rows = extract_table_rows(html)
+        logging.info("[pager] page=%s extracted_rows=%s", p, len(rows))
         if not rows:
+            logging.info("[pager] Empty rows on page %s, stop.", p)
             break
         yield from rows
 
@@ -209,9 +194,6 @@ def build_csv_rows(scrape_date: dt.date, items: List[Dict]) -> List[str]:
 
 
 def _append_in_chunks(append_client, lines: List[str], max_chunk_bytes: int = 3_900_000) -> None:
-    """
-    Bezpečné appendování ve větších dávkách (AppendBlob má limit ~4 MB na blok).
-    """
     buf = []
     size = 0
     for line in lines:
@@ -230,32 +212,25 @@ def main(mytimer: func.TimerRequest) -> None:
     scrape_date = dt.datetime.now().date()
     logging.info("[CoinDesk_Prediciction] Start %s", scrape_date.isoformat())
 
-    # --- sanity env checks ---
+    # --- env echo (bez tajemství) ---
+    logging.info("[env] OUTPUT_CONTAINER=%s AZURE_BLOB_NAME=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
+    logging.info("[env] MAX_PAGES=%s USER_AGENT=%s", MAX_PAGES, USER_AGENT)
     if not STORAGE_CONNECTION_STRING:
-        logging.error("AzureWebJobsStorage is not set. Exiting.")
-        return
-    if not OUTPUT_CONTAINER:
-        logging.error("OUTPUT_CONTAINER is not set. Exiting.")
-        return
-    if not AZURE_BLOB_NAME:
-        logging.error("AZURE_BLOB_NAME is not set. Exiting.")
+        logging.error("[env] AzureWebJobsStorage is NOT set. Exiting.")
         return
 
     try:
         all_items = list(iter_all_pages())
-        logging.info("Extracted %d tokens across pages", len(all_items))
-        if not all_items:
-            logging.warning("No predictions extracted; nothing to write.")
-            return
+        logging.info("[extract] total_items=%s", len(all_items))
 
         csv_lines = build_csv_rows(scrape_date, all_items)
-        logging.info("Prepared %d CSV lines to append", len(csv_lines))
+        logging.info("[csv] lines_to_append=%s", len(csv_lines))
 
-        # Lazy import blob klienta až tady (aby případný import error nebyl „instant fail“)
+        # Lazy import blob klienta (aby případný import error byl zalogovaný)
         try:
             from azure.storage.blob import BlobServiceClient, AppendBlobClient
         except Exception as e:
-            logging.error("Failed to import azure.storage.blob: %s", e)
+            logging.error("[blob] import error: %s", e)
             logging.error(traceback.format_exc())
             return
 
@@ -267,8 +242,9 @@ def main(mytimer: func.TimerRequest) -> None:
             container_client = blob_service.get_container_client(OUTPUT_CONTAINER)
             try:
                 container_client.create_container()
+                logging.info("[blob] container created: %s", OUTPUT_CONTAINER)
             except Exception:
-                pass  # existuje
+                logging.info("[blob] container exists: %s", OUTPUT_CONTAINER)
 
             # 2) připoj se jako AppendBlobClient
             append_client = AppendBlobClient.from_connection_string(
@@ -281,18 +257,25 @@ def main(mytimer: func.TimerRequest) -> None:
             if not append_client.exists():
                 append_client.create_blob()
                 append_client.append_block(CSV_HEADER.encode("utf-8"))
+                logging.info("[blob] created blob + header written: %s/%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
+            else:
+                logging.info("[blob] blob exists: %s/%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
 
-            # 4) append dat (s chunkováním pro jistotu)
+            # 4) pokud nejsou data, jen skončíme (CSV už existuje s hlavičkou)
+            if not csv_lines:
+                logging.warning("[csv] No rows to append (parser found 0 tokens).")
+                return
+
+            # 5) append dat (s chunkováním)
             _append_in_chunks(append_client, csv_lines)
-
-            logging.info("Append completed -> container=%s blob=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
+            logging.info("[blob] append completed: %s rows", len(csv_lines))
 
         except Exception as e:
-            logging.error("Blob I/O error: %s", e)
+            logging.error("[blob] I/O error: %s", e)
             logging.error(traceback.format_exc())
             return
 
     except Exception as e:
-        logging.error("Unhandled exception in CoinDesk_Prediciction: %s", e)
+        logging.error("[fatal] Unhandled exception in CoinDesk_Prediciction: %s", e)
         logging.error(traceback.format_exc())
         return
