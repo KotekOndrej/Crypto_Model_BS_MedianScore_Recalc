@@ -13,7 +13,7 @@ from dateutil.relativedelta import relativedelta
 
 # -------------------- Konfigurace --------------------
 COINCIDEX_BASE_URL = "https://coincodex.com/predictions/"
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/diag-1.0)")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/1.6)")
 TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Prague")  # informativní
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # použij storage Function Appu
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
@@ -141,7 +141,6 @@ def extract_table_rows(html: str) -> List[Dict]:
 
 def fetch_predictions_page(page: Optional[int] = None) -> Optional[str]:
     url = COINCIDEX_BASE_URL if not page or page == 1 else f"{COINCIDEX_BASE_URL}?page={page}"
-    # jednoduchý retry (2 pokusy)
     for attempt in range(1, 3):
         try:
             resp = requests.get(url, headers=HEADERS, timeout=45)
@@ -193,7 +192,48 @@ def build_csv_rows(scrape_date: dt.date, items: List[Dict]) -> List[str]:
     return rows
 
 
-def _append_in_chunks(append_client, lines: List[str], max_chunk_bytes: int = 3_900_000) -> None:
+def _append_blockblob_fallback(blob_client, header: str, lines: List[str]) -> None:
+    """
+    Fallback pro starší SDK bez AppendBlobClient:
+    - pokud blob neexistuje -> vytvoř s hlavičkou + data
+    - pokud existuje -> stáhni obsah, připoj nové řádky a nahraj s overwrite=True
+    Pozn.: pro běžné denní dávky je to naprosto OK.
+    """
+    from azure.core.exceptions import ResourceNotFoundError
+
+    new_payload = "".join(lines).encode("utf-8")
+    if not new_payload:
+        logging.warning("[blob-fallback] No rows to append.")
+        return
+
+    try:
+        # stáhni existující obsah (pokud je)
+        try:
+            stream = blob_client.download_blob()
+            existing = stream.readall()
+            logging.info("[blob-fallback] existing_size=%s", len(existing))
+        except ResourceNotFoundError:
+            existing = b""
+            logging.info("[blob-fallback] blob does not exist, will create.")
+
+        if not existing:
+            # vytvořit s hlavičkou
+            payload = header.encode("utf-8") + new_payload
+        else:
+            # zkontroluj, zda už má hlavičku
+            if not existing.startswith(header.encode("utf-8")):
+                payload = header.encode("utf-8") + existing + new_payload
+            else:
+                payload = existing + new_payload
+
+        blob_client.upload_blob(payload, overwrite=True)
+        logging.info("[blob-fallback] upload completed. final_size=%s", len(payload))
+    except Exception as e:
+        logging.error("[blob-fallback] upload error: %s", e)
+        logging.error(traceback.format_exc())
+
+
+def _append_in_chunks_appendblob(append_client, lines: List[str], max_chunk_bytes: int = 3_900_000) -> None:
     buf = []
     size = 0
     for line in lines:
@@ -211,10 +251,8 @@ def _append_in_chunks(append_client, lines: List[str], max_chunk_bytes: int = 3_
 def main(mytimer: func.TimerRequest) -> None:
     scrape_date = dt.datetime.now().date()
     logging.info("[CoinDesk_Prediciction] Start %s", scrape_date.isoformat())
+    logging.info("[env] OUTPUT_CONTAINER=%s AZURE_BLOB_NAME=%s MAX_PAGES=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME, MAX_PAGES)
 
-    # --- env echo (bez tajemství) ---
-    logging.info("[env] OUTPUT_CONTAINER=%s AZURE_BLOB_NAME=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
-    logging.info("[env] MAX_PAGES=%s USER_AGENT=%s", MAX_PAGES, USER_AGENT)
     if not STORAGE_CONNECTION_STRING:
         logging.error("[env] AzureWebJobsStorage is NOT set. Exiting.")
         return
@@ -226,19 +264,16 @@ def main(mytimer: func.TimerRequest) -> None:
         csv_lines = build_csv_rows(scrape_date, all_items)
         logging.info("[csv] lines_to_append=%s", len(csv_lines))
 
-        # Lazy import blob klienta (aby případný import error byl zalogovaný)
+        # Blob klient – bez tvrdé závislosti na AppendBlobClient
         try:
-            from azure.storage.blob import BlobServiceClient, AppendBlobClient
+            from azure.storage.blob import BlobServiceClient
         except Exception as e:
-            logging.error("[blob] import error: %s", e)
+            logging.error("[blob] import error BlobServiceClient: %s", e)
             logging.error(traceback.format_exc())
             return
 
-        # Blob inicializace
         try:
             blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
-
-            # 1) zajisti kontejner
             container_client = blob_service.get_container_client(OUTPUT_CONTAINER)
             try:
                 container_client.create_container()
@@ -246,29 +281,30 @@ def main(mytimer: func.TimerRequest) -> None:
             except Exception:
                 logging.info("[blob] container exists: %s", OUTPUT_CONTAINER)
 
-            # 2) připoj se jako AppendBlobClient
-            append_client = AppendBlobClient.from_connection_string(
-                STORAGE_CONNECTION_STRING,
-                container_name=OUTPUT_CONTAINER,
-                blob_name=AZURE_BLOB_NAME
-            )
-
-            # 3) pokud blob neexistuje, vytvoř ho (Append Blob) a zapiš hlavičku
-            if not append_client.exists():
-                append_client.create_blob()
-                append_client.append_block(CSV_HEADER.encode("utf-8"))
-                logging.info("[blob] created blob + header written: %s/%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
-            else:
-                logging.info("[blob] blob exists: %s/%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
-
-            # 4) pokud nejsou data, jen skončíme (CSV už existuje s hlavičkou)
-            if not csv_lines:
-                logging.warning("[csv] No rows to append (parser found 0 tokens).")
+            # Zkusíme použít AppendBlobClient, pokud je k dispozici
+            try:
+                from azure.storage.blob import AppendBlobClient
+                append_client = AppendBlobClient.from_connection_string(
+                    STORAGE_CONNECTION_STRING,
+                    container_name=OUTPUT_CONTAINER,
+                    blob_name=AZURE_BLOB_NAME
+                )
+                if not append_client.exists():
+                    append_client.create_blob()
+                    append_client.append_block(CSV_HEADER.encode("utf-8"))
+                    logging.info("[blob] created append blob + header written")
+                if csv_lines:
+                    _append_in_chunks_appendblob(append_client, csv_lines)
+                    logging.info("[blob] append completed via AppendBlobClient: %s rows", len(csv_lines))
+                else:
+                    logging.warning("[csv] No rows to append.")
                 return
+            except Exception as e:
+                logging.warning("[blob] AppendBlobClient not available or failed (%s). Falling back to Block Blob.", e)
 
-            # 5) append dat (s chunkováním)
-            _append_in_chunks(append_client, csv_lines)
-            logging.info("[blob] append completed: %s rows", len(csv_lines))
+            # Fallback: Block Blob emulace appendu
+            blob_client = container_client.get_blob_client(AZURE_BLOB_NAME)
+            _append_blockblob_fallback(blob_client, CSV_HEADER, csv_lines)
 
         except Exception as e:
             logging.error("[blob] I/O error: %s", e)
