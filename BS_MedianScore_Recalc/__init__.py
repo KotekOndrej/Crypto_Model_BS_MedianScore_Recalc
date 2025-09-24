@@ -329,7 +329,6 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         pnls.append(p)
         day_cycles.append(c)
 
-    # použijeme stejné np jako výše (žádné aliasy)
     import numpy as np  # lokální, už je importované, ale je to bezpečné
     pnls_arr = np.array(pnls, dtype=float)
     iqr_pnl = float(np.percentile(pnls_arr, 75) - np.percentile(pnls_arr, 25))
@@ -339,6 +338,10 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
     hit_rate_days = int(np.sum(np.array(day_cycles) > 0))
     dist_to_price = float(dist_rel)
 
+    # === NOVĚ: průměrný počet cyklů za celé období ===
+    n_days_period = len(history)
+    total_cycles_w = float(total_cycles) / float(max(n_days_period, 1))
+
     return {
         "pair": pair_name,
         "B": bestB,
@@ -346,6 +349,7 @@ def compute_bs_for_csv_bytes(csv_bytes: bytes, pair_name: str):
         "gap_pct": gap_pct,
         "model": MODEL_NAME,
         "total_cycles": total_cycles,
+        "total_cycles_w": total_cycles_w,     # <<<<<< přidáno
         "score": score,
         "avg_pnl_pct": avg_pnl_pct,
         "median_pnl_pct": median_pnl_pct,
@@ -428,6 +432,7 @@ def main(myTimer):
                 "model": res["model"],
                 "is_active": True,
                 "total_cycles": int(res.get("total_cycles", 0)),
+                "total_cycles_w": float(res.get("total_cycles_w", 0.0)),  # <<<<<< přidáno
                 "score": float(res.get("score", 0.0)),
                 "avg_pnl_pct": float(res.get("avg_pnl_pct", 0.0)),
                 "median_pnl_pct": float(res.get("median_pnl_pct", 0.0)),
@@ -460,8 +465,9 @@ def main(myTimer):
         return
 
     import pandas as pd
+    # === pořadí sloupců: total_cycles_w je HNED za total_cycles ===
     cols = ["pair","B","S","gap_pct","date","model","is_active",
-            "total_cycles","score","avg_pnl_pct","median_pnl_pct","load_time_utc",
+            "total_cycles","total_cycles_w","score","avg_pnl_pct","median_pnl_pct","load_time_utc",
             "side","p_up","iqr_pnl","std_pnl","pnl_p05","pnl_p95",
             "hit_rate_days","dist_to_price","min_gap_abs","costs_abs","n_candidates"]
     new_df = pd.DataFrame(new_rows, columns=cols)
@@ -484,9 +490,11 @@ def main(myTimer):
         if master_blob.exists():
             master_bytes = master_blob.download_blob().readall()
             master_df = pd.read_csv(io.BytesIO(master_bytes))
+            # doplň chybějící sloupce
             for c in master_cols:
                 if c not in master_df.columns:
                     master_df[c] = None
+            # seřaď podle master_cols (ať je total_cycles_w na správném místě)
             master_df = master_df[master_cols]
         else:
             master_df = pd.DataFrame(columns=master_cols)
@@ -499,7 +507,7 @@ def main(myTimer):
             mask = (
                 (master_df["pair"] == row["pair"]) &
                 (master_df["model"] == MODEL_NAME) &   # <- explicitně jen BS_MedianScore
-                (master_df["is_active"] == True)    
+                (master_df["is_active"] == True)
             )
             if mask.any():
                 master_df.loc[mask, "is_active"] = False
