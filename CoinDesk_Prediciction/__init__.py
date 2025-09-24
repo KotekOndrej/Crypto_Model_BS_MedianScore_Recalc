@@ -10,11 +10,10 @@ import azure.functions as func
 import requests
 from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
-from azure.storage.blob import BlobServiceClient, AppendBlobClient
 
 # -------------------- Konfigurace --------------------
 COINCIDEX_BASE_URL = "https://coincodex.com/predictions/"
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/1.4)")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/1.5)")
 TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Prague")  # informativní
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # použij storage Function Appu
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
@@ -209,6 +208,23 @@ def build_csv_rows(scrape_date: dt.date, items: List[Dict]) -> List[str]:
     return rows
 
 
+def _append_in_chunks(append_client, lines: List[str], max_chunk_bytes: int = 3_900_000) -> None:
+    """
+    Bezpečné appendování ve větších dávkách (AppendBlob má limit ~4 MB na blok).
+    """
+    buf = []
+    size = 0
+    for line in lines:
+        b = line.encode("utf-8")
+        if size + len(b) > max_chunk_bytes and buf:
+            append_client.append_block(b"".join(buf))
+            buf, size = [], 0
+        buf.append(b)
+        size += len(b)
+    if buf:
+        append_client.append_block(b"".join(buf))
+
+
 # -------------------- Azure Function entrypoint --------------------
 def main(mytimer: func.TimerRequest) -> None:
     scrape_date = dt.datetime.now().date()
@@ -235,45 +251,46 @@ def main(mytimer: func.TimerRequest) -> None:
         csv_lines = build_csv_rows(scrape_date, all_items)
         logging.info("Prepared %d CSV lines to append", len(csv_lines))
 
-        # Blob inicializace
-        blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
-
-        # 1) zajisti kontejner
-        container_client = blob_service.get_container_client(OUTPUT_CONTAINER)
+        # Lazy import blob klienta až tady (aby případný import error nebyl „instant fail“)
         try:
-            container_client.create_container()
-        except Exception:
-            pass  # existuje
+            from azure.storage.blob import BlobServiceClient, AppendBlobClient
+        except Exception as e:
+            logging.error("Failed to import azure.storage.blob: %s", e)
+            logging.error(traceback.format_exc())
+            return
 
-        # 2) připoj se jako AppendBlobClient (kompatibilní se staršími verzemi SDK)
-        append_client = AppendBlobClient.from_connection_string(
-            STORAGE_CONNECTION_STRING,
-            container_name=OUTPUT_CONTAINER,
-            blob_name=AZURE_BLOB_NAME
-        )
+        # Blob inicializace
+        try:
+            blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
 
-        # 3) pokud blob neexistuje, vytvoř ho (Append Blob) a zapiš hlavičku
-        if not append_client.exists():
-            append_client.create_blob()
-            append_client.append_block(CSV_HEADER.encode("utf-8"))
-        else:
-            # volitelně: ověř typ blobu
+            # 1) zajisti kontejner
+            container_client = blob_service.get_container_client(OUTPUT_CONTAINER)
             try:
-                props = append_client.get_blob_properties()
-                blob_type = getattr(props, "blob_type", None)
-                if blob_type and str(blob_type).lower() != "appendblob":
-                    logging.error("Target blob exists but is not AppendBlob. Name=%s", AZURE_BLOB_NAME)
-                    return
+                container_client.create_container()
             except Exception:
-                # některé starší verze nemusí mít blob_type; nevadí
-                pass
+                pass  # existuje
 
-        # 4) append dat
-        payload = "".join(csv_lines).encode("utf-8")
-        if payload:
-            append_client.append_block(payload)
+            # 2) připoj se jako AppendBlobClient
+            append_client = AppendBlobClient.from_connection_string(
+                STORAGE_CONNECTION_STRING,
+                container_name=OUTPUT_CONTAINER,
+                blob_name=AZURE_BLOB_NAME
+            )
 
-        logging.info("Append completed -> container=%s blob=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
+            # 3) pokud blob neexistuje, vytvoř ho (Append Blob) a zapiš hlavičku
+            if not append_client.exists():
+                append_client.create_blob()
+                append_client.append_block(CSV_HEADER.encode("utf-8"))
+
+            # 4) append dat (s chunkováním pro jistotu)
+            _append_in_chunks(append_client, csv_lines)
+
+            logging.info("Append completed -> container=%s blob=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
+
+        except Exception as e:
+            logging.error("Blob I/O error: %s", e)
+            logging.error(traceback.format_exc())
+            return
 
     except Exception as e:
         logging.error("Unhandled exception in CoinDesk_Prediciction: %s", e)
