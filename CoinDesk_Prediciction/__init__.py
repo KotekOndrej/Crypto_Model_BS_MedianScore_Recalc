@@ -3,22 +3,27 @@ import logging
 import os
 import re
 from decimal import Decimal, InvalidOperation
+from typing import Tuple, List, Dict, Optional
 
 import azure.functions as func
 import requests
 from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
-from azure.storage.blob import BlobServiceClient, ContainerClient
+from azure.storage.blob import BlobServiceClient, ContainerClient, AppendBlobClient
 
-# -------- Config z env proměnných --------
+# -------------------- Konfigurace z env proměnných --------------------
 COINCIDEX_BASE_URL = "https://coincodex.com/predictions/"
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/1.1)")
-TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Prague")  # informativní – scrape_date se bere jako lokální datum
-CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-CONTAINER_NAME = os.getenv("AZURE_BLOB_CONTAINER", "predictions")
-BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "coincodex_predictions.csv")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/1.2)")
+TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Prague")  # informativní; scrape_date = lokální date.today()
 
-# Kolik paginací zkusíme maximálně (breakne se dřív, když je stránka prázdná)
+# Použij standardní storage účet Function Appu
+STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")
+
+# Nové názvy / defaulty
+OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
+AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "stgbinancedata")  # požadovaný default
+
+# Max. počet stran stránkování
 MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
 
 HEADERS = {
@@ -26,6 +31,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# Mapování hlaviček tabulky na (zkrácený label, funkci pro výpočet model_to)
 HORIZON_MAP = {
     "5D Prediction": ("5D", lambda d: d + relativedelta(days=5)),
     "1M Prediction": ("1M", lambda d: d + relativedelta(months=1)),
@@ -34,21 +40,22 @@ HORIZON_MAP = {
     "1Y Prediction": ("1Y", lambda d: d + relativedelta(years=1)),
 }
 
-# NOVÁ HLAVIČKA: přidaný sloupec predicted_change_pct
+# CSV hlavička – append-only
 CSV_HEADER = "scrape_date,symbol,token_name,horizon,model_to,predicted_price,predicted_change_pct\n"
 
 
-def parse_price_and_change(text: str) -> tuple[Decimal | None, Decimal | None]:
+# -------------------- Helpery parsování --------------------
+def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
     """
-    Z textu typu "$ 4,660.39 11.49%" extrahuje:
+    Z buňky typu: "$ 4,660.39 11.49%" vytáhne:
       - cenu (Decimal) 4660.39
-      - procentuální změnu (Decimal) 11.49  (může být i záporná, např. -2.15)
+      - procentuální změnu (Decimal) 11.49 (může být záporná)
     Pokud něco chybí, vrací None.
     """
     if not text:
         return None, None
 
-    # cena: první peněžní číslo
+    # cena: první peněžní číslo (povolíme tisícové čárky)
     m_price = re.search(
         r"[-]?\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
         text
@@ -73,25 +80,21 @@ def parse_price_and_change(text: str) -> tuple[Decimal | None, Decimal | None]:
     return price_dec, pct_dec
 
 
-def extract_table_rows(html: str) -> list[dict]:
+def extract_table_rows(html: str) -> List[Dict]:
     """
-    Z HTML stránky /predictions/ vytáhne seznam záznamů:
+    Z HTML /predictions/ vyčte list tokenů s predikcemi a procenty:
     {
-      'symbol': 'ETH',
-      'token_name': 'Ethereum',
+      'symbol': 'ETH', 'token_name': 'Ethereum',
       'pred_5d': Decimal, 'chg_5d': Decimal,
-      'pred_1m': Decimal, 'chg_1m': Decimal,
-      ...
+      'pred_1m': Decimal, 'chg_1m': Decimal, ...
     }
-    Vrací list pro jednu stránku (bez stránkování).
     """
     soup = BeautifulSoup(html, "lxml")
 
-    # Najdi tabulku podle hlavičky obsahující "5D Prediction"
     table = None
     for t in soup.find_all("table"):
         headers = [th.get_text(strip=True) for th in t.find_all("th")]
-        if any("5D" in h and "Prediction" in h for h in headers):
+        if any(("5D" in h and "Prediction" in h) for h in headers):
             table = t
             break
     if table is None:
@@ -108,7 +111,7 @@ def extract_table_rows(html: str) -> list[dict]:
     if not tbody:
         return []
 
-    rows = []
+    rows: List[Dict] = []
     for tr in tbody.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) < len(header_texts):
@@ -138,8 +141,8 @@ def extract_table_rows(html: str) -> list[dict]:
                 else:
                     token_name = atext
 
-        preds = {}
-        chgs = {}
+        preds: Dict[str, Optional[Decimal]] = {}
+        chgs: Dict[str, Optional[Decimal]] = {}
         for header in required[1:]:
             cell_text = tds[col_idx[header]].get_text(" ", strip=True)
             price, pct = parse_price_and_change(cell_text)
@@ -165,7 +168,7 @@ def extract_table_rows(html: str) -> list[dict]:
     return rows
 
 
-def fetch_predictions_page(page: int | None = None) -> str | None:
+def fetch_predictions_page(page: Optional[int] = None) -> Optional[str]:
     url = COINCIDEX_BASE_URL if not page or page == 1 else f"{COINCIDEX_BASE_URL}?page={page}"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=30)
@@ -186,33 +189,28 @@ def iter_all_pages(max_pages: int = MAX_PAGES):
             break
         rows = extract_table_rows(html)
         if not rows:
-            # Konec stránkování (nebo změna layoutu)
             break
         for r in rows:
             yield r
 
 
+# -------------------- Blob helpery --------------------
 def ensure_container(client: BlobServiceClient, container_name: str) -> ContainerClient:
     container_client = client.get_container_client(container_name)
     try:
         container_client.create_container()
     except Exception:
+        # container pravděpodobně existuje
         pass
     return container_client
 
 
-def append_csv_lines(container_client: ContainerClient, blob_name: str, lines: list[str]):
+def append_csv_lines(container_client: ContainerClient, blob_name: str, lines: List[str]) -> None:
     """
-    Append-only zápis do blokového blobu:
-    - Pokud blob neexistuje, vytvoříme ho s hlavičkou.
-    - Poté připojujeme text (append) pomocí Stage+Commit (upload_blob append=False by přepsal).
-    Jednoduché a kompatibilní řešení: použít "upload_blob(..., overwrite=False)" pro první zápis
-    a následně "append" simulovat re-uploadem celého payloadu by bylo neefektivní.
-    Proto zde použijeme Append Blob API (ideální pro log/CSV append).
+    Append-only zapisuje do Append Blobu.
+    Pokud blob neexistuje, vytvoří se a zapíše se hlavička.
     """
-    from azure.storage.blob import AppendBlobClient
-
-    append_client = container_client.get_blob_client(blob_name).as_append_blob_client()
+    append_client: AppendBlobClient = container_client.get_blob_client(blob_name).as_append_blob_client()
     try:
         if not append_client.exists():
             append_client.create_blob()
@@ -226,27 +224,17 @@ def append_csv_lines(container_client: ContainerClient, blob_name: str, lines: l
         append_client.append_block(payload)
 
 
-def build_csv_rows(scrape_date: dt.date, items: list[dict]) -> list[str]:
+def build_csv_rows(scrape_date: dt.date, items: List[Dict]) -> List[str]:
     """
-    Z listu {symbol, token_name, pred_5d, chg_5d, ...} vytvoří řádky CSV pro všechny horizonty.
+    Vytvoří CSV řádky pro všechny horizonty.
     CSV: scrape_date,symbol,token_name,horizon,model_to,predicted_price,predicted_change_pct
     """
-    rows = []
-
-    def horiz_pair(label: str, price: Decimal | None, pct: Decimal | None, header_name: str):
-        if price is None:
-            return None
-        _, fn = HORIZON_MAP[header_name]
-        model_to = fn(scrape_date)
-        pct_str = "" if pct is None else str(pct)  # prázdné, když procento není dostupné
-        # CSV řádek
-        return f"{scrape_date.isoformat()},{symbol},{token_name},{label},{model_to.isoformat()},{price},{pct_str}\n"
+    rows: List[str] = []
 
     for it in items:
         symbol = it["symbol"]
         token_name = it.get("token_name", "")
 
-        # (label, price, pct, header_name)
         pairs = [
             ("5D", it.get("pred_5d"), it.get("chg_5d"), "5D Prediction"),
             ("1M", it.get("pred_1m"), it.get("chg_1m"), "1M Prediction"),
@@ -255,16 +243,21 @@ def build_csv_rows(scrape_date: dt.date, items: list[dict]) -> list[str]:
             ("1Y", it.get("pred_1y"), it.get("chg_1y"), "1Y Prediction"),
         ]
         for label, price, pct, header_name in pairs:
-            row = horiz_pair(label, price, pct, header_name)
-            if row:
-                rows.append(row)
+            if price is None:
+                continue
+            _, to_fn = HORIZON_MAP[header_name]
+            model_to = to_fn(scrape_date)
+            pct_str = "" if pct is None else str(pct)  # pokud procento není uvedeno, nech prázdné
+            row = f"{scrape_date.isoformat()},{symbol},{token_name},{label},{model_to.isoformat()},{price},{pct_str}\n"
+            rows.append(row)
 
     return rows
 
 
+# -------------------- Azure Function entrypoint --------------------
 def main(mytimer: func.TimerRequest) -> None:
     scrape_date = dt.datetime.now().date()
-    logging.info("Starting CoinCodex predictions scrape for %s", scrape_date.isoformat())
+    logging.info("[CoinDesk_Prediciction] Start scrape for %s", scrape_date.isoformat())
 
     all_items = list(iter_all_pages())
     logging.info("Extracted %d tokens across pages", len(all_items))
@@ -276,12 +269,12 @@ def main(mytimer: func.TimerRequest) -> None:
     csv_lines = build_csv_rows(scrape_date, all_items)
     logging.info("Prepared %d CSV lines to append", len(csv_lines))
 
-    if not CONNECTION_STRING:
-        logging.error("AZURE_STORAGE_CONNECTION_STRING is not set. Aborting.")
+    if not STORAGE_CONNECTION_STRING:
+        logging.error("AzureWebJobsStorage is not set. Aborting.")
         return
 
-    blob_service = BlobServiceClient.from_connection_string(CONNECTION_STRING)
-    container_client = ensure_container(blob_service, CONTAINER_NAME)
-    append_csv_lines(container_client, BLOB_NAME, csv_lines)
+    blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+    container_client = ensure_container(blob_service, OUTPUT_CONTAINER)
+    append_csv_lines(container_client, AZURE_BLOB_NAME, csv_lines)
 
-    logging.info("Append completed -> container=%s blob=%s", CONTAINER_NAME, BLOB_NAME)
+    logging.info("Append completed -> container=%s blob=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
