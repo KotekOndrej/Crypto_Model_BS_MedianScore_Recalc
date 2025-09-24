@@ -17,7 +17,7 @@ USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPre
 TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Prague")  # informativní
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # použij storage Function Appu
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
-AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "stgbinancedata")  # default požadovaný
+AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "CoinDeskModels.csv")  # default požadovaný
 MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
 
 HEADERS = {
