@@ -10,14 +10,15 @@ import azure.functions as func
 import requests
 from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
+from azure.storage.blob import BlobServiceClient, AppendBlobClient
 
 # -------------------- Konfigurace --------------------
 COINCIDEX_BASE_URL = "https://coincodex.com/predictions/"
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/1.3)")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/1.4)")
 TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Prague")  # informativní
-STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # použijeme storage Function Appu
+STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # použij storage Function Appu
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
-AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "stgbinancedata")  # požadovaný default
+AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "stgbinancedata")  # default požadovaný
 MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
 
 HEADERS = {
@@ -25,6 +26,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# Mapování sloupců na label + funkci výpočtu cílového data
 HORIZON_MAP = {
     "5D Prediction": ("5D", lambda d: d + relativedelta(days=5)),
     "1M Prediction": ("1M", lambda d: d + relativedelta(months=1)),
@@ -33,12 +35,22 @@ HORIZON_MAP = {
     "1Y Prediction": ("1Y", lambda d: d + relativedelta(years=1)),
 }
 
+# CSV hlavička – append-only
 CSV_HEADER = "scrape_date,symbol,token_name,horizon,model_to,predicted_price,predicted_change_pct\n"
+
 
 # -------------------- Parser helpery --------------------
 def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    """
+    Z buňky typu "$ 4,660.39 11.49%" vytáhne:
+      - cenu (Decimal) 4660.39
+      - procentuální změnu (Decimal) 11.49 (může být záporná)
+    Pokud něco chybí, vrací None.
+    """
     if not text:
         return None, None
+
+    # cena: první peněžní číslo (povolíme tisícové čárky)
     m_price = re.search(
         r"[-]?\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
         text
@@ -51,6 +63,7 @@ def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decim
         except InvalidOperation:
             price_dec = None
 
+    # procento: první výskyt čísla s %
     m_pct = re.search(r"([+\-]?\d+(?:\.\d+)?)\s*%", text)
     pct_dec: Optional[Decimal] = None
     if m_pct:
@@ -67,7 +80,7 @@ def extract_table_rows(html: str) -> List[Dict]:
     Vrací list dictů:
       { symbol, token_name, pred_5d, chg_5d, pred_1m, chg_1m, ... }
     """
-    # ⚠️ Použijeme vestavěný parser, abychom se vyhnuli závislosti na lxml
+    # Použijeme vestavěný parser, abychom se vyhnuli závislosti na lxml
     soup = BeautifulSoup(html, "html.parser")
 
     table = None
@@ -96,6 +109,7 @@ def extract_table_rows(html: str) -> List[Dict]:
         if len(tds) < len(header_texts):
             continue
 
+        # Name: typicky "ETH Ethereum"
         name_cell = tds[col_idx["Name"]]
         name_text = name_cell.get_text(" ", strip=True)
         symbol = None
@@ -195,19 +209,20 @@ def build_csv_rows(scrape_date: dt.date, items: List[Dict]) -> List[str]:
     return rows
 
 
+# -------------------- Azure Function entrypoint --------------------
 def main(mytimer: func.TimerRequest) -> None:
     scrape_date = dt.datetime.now().date()
     logging.info("[CoinDesk_Prediciction] Start %s", scrape_date.isoformat())
 
-    # --- sanity env checks (měkké ukončení místo crash) ---
+    # --- sanity env checks ---
     if not STORAGE_CONNECTION_STRING:
-        logging.error("AzureWebJobsStorage is not set. Exiting gracefully.")
+        logging.error("AzureWebJobsStorage is not set. Exiting.")
         return
     if not OUTPUT_CONTAINER:
-        logging.error("OUTPUT_CONTAINER is not set. Exiting gracefully.")
+        logging.error("OUTPUT_CONTAINER is not set. Exiting.")
         return
     if not AZURE_BLOB_NAME:
-        logging.error("AZURE_BLOB_NAME is not set. Exiting gracefully.")
+        logging.error("AZURE_BLOB_NAME is not set. Exiting.")
         return
 
     try:
@@ -220,40 +235,47 @@ def main(mytimer: func.TimerRequest) -> None:
         csv_lines = build_csv_rows(scrape_date, all_items)
         logging.info("Prepared %d CSV lines to append", len(csv_lines))
 
-        # Lazy import blob klienta až tady (aby import-error nezhodil start)
-        try:
-            from azure.storage.blob import BlobServiceClient
-        except Exception as e:
-            logging.error("Failed to import azure.storage.blob: %s", e)
-            logging.error(traceback.format_exc())
-            return
+        # Blob inicializace
+        blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
 
+        # 1) zajisti kontejner
+        container_client = blob_service.get_container_client(OUTPUT_CONTAINER)
         try:
-            blob_service = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
-            container_client = blob_service.get_container_client(OUTPUT_CONTAINER)
+            container_client.create_container()
+        except Exception:
+            pass  # existuje
+
+        # 2) připoj se jako AppendBlobClient (kompatibilní se staršími verzemi SDK)
+        append_client = AppendBlobClient.from_connection_string(
+            STORAGE_CONNECTION_STRING,
+            container_name=OUTPUT_CONTAINER,
+            blob_name=AZURE_BLOB_NAME
+        )
+
+        # 3) pokud blob neexistuje, vytvoř ho (Append Blob) a zapiš hlavičku
+        if not append_client.exists():
+            append_client.create_blob()
+            append_client.append_block(CSV_HEADER.encode("utf-8"))
+        else:
+            # volitelně: ověř typ blobu
             try:
-                container_client.create_container()
+                props = append_client.get_blob_properties()
+                blob_type = getattr(props, "blob_type", None)
+                if blob_type and str(blob_type).lower() != "appendblob":
+                    logging.error("Target blob exists but is not AppendBlob. Name=%s", AZURE_BLOB_NAME)
+                    return
             except Exception:
-                pass  # existuje
+                # některé starší verze nemusí mít blob_type; nevadí
+                pass
 
-            append_client = container_client.get_blob_client(AZURE_BLOB_NAME).as_append_blob_client()
-            if not append_client.exists():
-                append_client.create_blob()
-                append_client.append_block(CSV_HEADER.encode("utf-8"))
+        # 4) append dat
+        payload = "".join(csv_lines).encode("utf-8")
+        if payload:
+            append_client.append_block(payload)
 
-            payload = "".join(csv_lines).encode("utf-8")
-            if payload:
-                append_client.append_block(payload)
-
-            logging.info("Append completed -> container=%s blob=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
-
-        except Exception as e:
-            logging.error("Blob I/O error: %s", e)
-            logging.error(traceback.format_exc())
-            return
+        logging.info("Append completed -> container=%s blob=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
 
     except Exception as e:
-        # Catch-all, aby se běh neoznačil jako Failed bez detailu
         logging.error("Unhandled exception in CoinDesk_Prediciction: %s", e)
         logging.error(traceback.format_exc())
         return
