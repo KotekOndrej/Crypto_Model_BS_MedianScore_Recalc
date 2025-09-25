@@ -17,14 +17,19 @@ from dateutil.relativedelta import relativedelta
 
 # -------------------- Konfigurace --------------------
 COINCIDEX_BASE_URL = "https://coincodex.com/predictions/"
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/3.1)")
+COIN_DETAIL_URL_TMPL = "https://coincodex.com/crypto/{slug}/price-prediction/"
+
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/3.2)")
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # storage Function Appu
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
-AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "CoinDeskModels.csv")  # výchozí název CSV
+AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "CoinDeskModels.csv")
 
-# Stránkování: zkusíme page=1..MAX_PAGES; zastavíme, když nic nepřibývá
+# Stránkování + pauzy
 MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))
-PAGE_SLEEP_MS = int(os.getenv("PAGE_SLEEP_MS", "0"))  # např. 200–500 ms pokud by web škrtal
+PAGE_SLEEP_MS = int(os.getenv("PAGE_SLEEP_MS", "200"))      # pauza mezi stránkami
+DETAIL_SLEEP_MS = int(os.getenv("DETAIL_SLEEP_MS", "100"))  # pauza mezi detailními dotazy
+
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "45"))
 
 HEADERS = {
     "User-Agent": USER_AGENT,
@@ -50,7 +55,20 @@ CSV_FIELDS = [
 ]
 CSV_HEADER = ",".join(CSV_FIELDS) + "\n"
 
-# -------------------- Parser helpery --------------------
+# -------------------- Helpery --------------------
+def dlog(msg, *args):
+    logging.info(msg, *args)
+
+def hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+def parse_decimal_safe(num_str: str) -> Optional[Decimal]:
+    try:
+        return Decimal(num_str)
+    except Exception:
+        return None
+
+# -------------------- Parser tabulky /predictions/ --------------------
 def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
     """Z buňky typu '$ 4,660.39 11.49%' vytáhne cenu (Decimal) a % změnu (Decimal)."""
     if not text:
@@ -59,17 +77,11 @@ def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decim
     price_dec: Optional[Decimal] = None
     if m_price:
         num = m_price.group(1).replace(",", "")
-        try:
-            price_dec = Decimal(num)
-        except InvalidOperation:
-            price_dec = None
+        price_dec = parse_decimal_safe(num)
     m_pct = re.search(r"([+\-]?\d+(?:\.\d+)?)\s*%", text)
     pct_dec: Optional[Decimal] = None
     if m_pct:
-        try:
-            pct_dec = Decimal(m_pct.group(1))
-        except InvalidOperation:
-            pct_dec = None
+        pct_dec = parse_decimal_safe(m_pct.group(1))
     return price_dec, pct_dec
 
 
@@ -77,12 +89,12 @@ def extract_table_rows(html: str) -> List[Dict]:
     """
     Vrací list dictů:
       {
-        symbol, token_name, current_price,
+        symbol, token_name, slug (pokud šel vyčíst),
+        current_price,
         pred_5d, chg_5d, pred_1m, chg_1m, pred_3m, chg_3m, pred_6m, chg_6m, pred_1y, chg_1y
       }
     """
     soup = BeautifulSoup(html, "html.parser")
-
     table = None
     for t in soup.find_all("table"):
         headers = [th.get_text(strip=True) for th in t.find_all("th")]
@@ -95,7 +107,7 @@ def extract_table_rows(html: str) -> List[Dict]:
     header_texts = [th.get_text(strip=True) for th in table.find_all("th")]
     col_idx = {name: i for i, name in enumerate(header_texts)}
 
-    # Price sloupec (může být různě pojmenován, hledáme 'Price')
+    # Price sloupec
     price_col_name = None
     if "Price" in col_idx:
         price_col_name = "Price"
@@ -119,11 +131,19 @@ def extract_table_rows(html: str) -> List[Dict]:
         if len(tds) < len(header_texts):
             continue
 
-        # Name: např. "ETH Ethereum"
+        # Name cell → symbol + token_name + slug (z <a href="/crypto/<slug>/">)
         name_cell = tds[col_idx["Name"]]
         name_text = name_cell.get_text(" ", strip=True)
         symbol = None
         token_name = None
+        slug = None
+
+        a = name_cell.find("a")
+        if a and a.get("href"):
+            m = re.search(r"/crypto/([^/]+)/?", a.get("href"))
+            if m:
+                slug = m.group(1).strip()
+
         if name_text:
             parts = name_text.split()
             if len(parts) >= 2:
@@ -132,16 +152,14 @@ def extract_table_rows(html: str) -> List[Dict]:
             else:
                 token_name = name_text
 
-        if not symbol:
-            a = name_cell.find("a")
-            if a and a.get_text(strip=True):
-                atext = a.get_text(" ", strip=True)
-                parts = atext.split()
-                if len(parts) >= 2:
-                    symbol = parts[0]
-                    token_name = " ".join(parts[1:])
-                else:
-                    token_name = atext
+        if not symbol and a and a.get_text(strip=True):
+            atext = a.get_text(" ", strip=True)
+            parts = atext.split()
+            if len(parts) >= 2:
+                symbol = parts[0]
+                token_name = " ".join(parts[1:])
+            else:
+                token_name = atext
 
         # Aktuální cena
         current_price: Optional[Decimal] = None
@@ -164,6 +182,7 @@ def extract_table_rows(html: str) -> List[Dict]:
             rows.append({
                 "symbol": symbol,
                 "token_name": token_name or "",
+                "slug": slug,
                 "current_price": current_price,
                 "pred_5d": preds.get("5D Prediction"),
                 "chg_5d": chgs.get("5D Prediction"),
@@ -176,58 +195,123 @@ def extract_table_rows(html: str) -> List[Dict]:
                 "pred_1y": preds.get("1Y Prediction"),
                 "chg_1y": chgs.get("1Y Prediction"),
             })
+
     return rows
 
+# -------------------- Detail coinu /price-prediction/ --------------------
+def enrich_from_coin_detail(session: requests.Session, item: Dict) -> Dict:
+    """
+    Pokud v item chybí některé predikce/price, zkusí je doplnit z detailu coinu.
+    Na vstupu očekává klíče symbol, token_name, slug (volitelně), pred_* a chg_*, current_price.
+    """
+    slug = item.get("slug")
+    if not slug:
+        return item  # bez slugu detail nevyřešíme
 
-def fetch_predictions_page(page: int) -> Optional[str]:
+    url = COIN_DETAIL_URL_TMPL.format(slug=slug)
+    try:
+        resp = session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT)
+        dlog("[detail] slug=%s status=%s len=%s", slug, resp.status_code, len(resp.text))
+        if resp.status_code != 200:
+            return item
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Aktuální cena – bývá v hlavičce, fallback necháme pokud nenajdeme
+        if item.get("current_price") is None:
+            price_el = soup.find(string=re.compile(r"Price", re.I))
+            # necháme na tabulkovém doplnění; detail není konzistentní, tak nepřeháníme
+
+        # Tabulky s predikcemi – hledej řádky s textem "5-Day", "1-Month", "3-Month", "6-Month", "1-Year"
+        # a vedle nich cenu a případně % změnu.
+        # Pro jednoduchost vezmeme první číslo v řádku jako cenu a první % jako změnu.
+        def find_row(label_regex: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+            row = soup.find(string=re.compile(label_regex, re.I))
+            if not row:
+                return None, None
+            # vezmeme parent a jeho text
+            section = row.parent.get_text(" ", strip=True) if hasattr(row, "parent") else str(row)
+            return parse_price_and_change(section)
+
+        mapping = [
+            ("5D", "5[-\s]?Day"),
+            ("1M", "1[-\s]?Month"),
+            ("3M", "3[-\s]?Month"),
+            ("6M", "6[-\s]?Month"),
+            ("1Y", "1[-\s]?Year"),
+        ]
+
+        label_to_key = {
+            "5D": ("pred_5d", "chg_5d"),
+            "1M": ("pred_1m", "chg_1m"),
+            "3M": ("pred_3m", "chg_3m"),
+            "6M": ("pred_6m", "chg_6m"),
+            "1Y": ("pred_1y", "chg_1y"),
+        }
+
+        improved = False
+        for short, rx in mapping:
+            k_price, k_chg = label_to_key[short]
+            if item.get(k_price) is None or item.get(k_chg) is None:
+                price, pct = find_row(rx)
+                if price is not None and item.get(k_price) is None:
+                    item[k_price] = price
+                    improved = True
+                if pct is not None and item.get(k_chg) is None:
+                    item[k_chg] = pct
+                    improved = True
+
+        return item
+    except Exception:
+        return item
+
+# -------------------- Stažení stránek s predikcemi --------------------
+def fetch_predictions_page(session: requests.Session, page: int) -> Optional[str]:
     """
     Zkusí načíst stránku s parametrem ?page=N. Pro page=1 použij základní URL.
-    Některé verze webu vrací stále první stránku — ošetříme v iterátoru.
     """
     url = COINCIDEX_BASE_URL if page == 1 else f"{COINCIDEX_BASE_URL}?page={page}"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=45)
-        logging.info("[fetch] page=%s status=%s len=%s", page, resp.status_code, len(resp.text))
+        resp = session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT)
+        dlog("[fetch] page=%s status=%s len=%s", page, resp.status_code, len(resp.text))
         if resp.status_code == 200:
             return resp.text
-        logging.warning("[fetch] Non-200 status for %s: %s", url, resp.status_code)
     except Exception as e:
         logging.warning("[fetch] Error on %s: %s", url, e)
     return None
-
-
-def hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def iter_all_items() -> List[Dict]:
     """
     Iteruje stránkami ?page=1..MAX_PAGES, agreguje a deduplikuje tokeny.
     Zastaví se, pokud:
-      - extract_table_rows vrátí 0 řádků, nebo
-      - hash HTML je stejný jako u předchozí stránky (pravděpodobně pořád 1. stránka), nebo
-      - nově přidané tokeny = 0 (už nic nepřibývá).
+      - extract_table_rows vrátí 0 řádků,
+      - hash HTML je stejný jako u předchozí stránky,
+      - nově přidané tickery = 0.
+    Po primárním sběru ještě zkusí doplnit chybějící hodnoty z detailů (pokud je k dispozici slug).
     """
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
     all_items: List[Dict] = []
     seen_symbols = set()
     prev_hash = None
 
     for page in range(1, MAX_PAGES + 1):
-        html = fetch_predictions_page(page)
+        html = fetch_predictions_page(session, page)
         if not html:
-            logging.info("[pager] empty html, stop at page %s", page)
+            dlog("[pager] empty html, stop at page %s", page)
             break
 
         h = hash_text(html)
         if prev_hash is not None and h == prev_hash:
-            logging.info("[pager] html identical to previous page (%s==%s), stop.", page, page-1)
+            dlog("[pager] html identical to previous page (%s==%s), stop.", page, page - 1)
             break
         prev_hash = h
 
         rows = extract_table_rows(html)
-        logging.info("[pager] page=%s extracted_rows=%s", page, len(rows))
+        dlog("[pager] page=%s extracted_rows=%s", page, len(rows))
         if not rows:
-            logging.info("[pager] no rows on page %s, stop.", page)
+            dlog("[pager] no rows on page %s, stop.", page)
             break
 
         added = 0
@@ -239,14 +323,27 @@ def iter_all_items() -> List[Dict]:
             all_items.append(it)
             added += 1
 
-        logging.info("[pager] page=%s newly_added_symbols=%s total_symbols=%s", page, added, len(all_items))
+        dlog("[pager] page=%s newly_added_symbols=%s total_symbols=%s", page, added, len(all_items))
         if added == 0:
-            logging.info("[pager] no new symbols, stop.")
+            dlog("[pager] no new symbols, stop.")
             break
 
         if PAGE_SLEEP_MS > 0:
             time.sleep(PAGE_SLEEP_MS / 1000.0)
 
+    # Fallback enrichment z detailů – doplnění chybějících predikcí (pokud máme slug)
+    improved = 0
+    for idx, it in enumerate(all_items):
+        before = (it.get("pred_5d"), it.get("pred_1m"), it.get("pred_3m"), it.get("pred_6m"), it.get("pred_1y"))
+        it2 = enrich_from_coin_detail(session, it)
+        after = (it2.get("pred_5d"), it2.get("pred_1m"), it2.get("pred_3m"), it2.get("pred_6m"), it2.get("pred_1y"))
+        if after != before:
+            improved += 1
+        all_items[idx] = it2
+        if DETAIL_SLEEP_MS > 0:
+            time.sleep(DETAIL_SLEEP_MS / 1000.0)
+
+    dlog("[enrich] improved_items=%s of %s", improved, len(all_items))
     return all_items
 
 
@@ -259,7 +356,6 @@ def dedup_items_by_symbol(items: List[Dict]) -> List[Dict]:
             continue
         uniq[sym] = it
     return list(uniq.values())
-
 
 # -------------------- CSV I/O --------------------
 def load_csv_rows(container_client, blob_name: str) -> List[Dict]:
@@ -281,7 +377,7 @@ def load_csv_rows(container_client, blob_name: str) -> List[Dict]:
         for r in reader:
             out = {k: r.get(k, "") for k in CSV_FIELDS}
             rows.append(out)
-    logging.info("[csv-read] loaded rows=%s", len(rows))
+    dlog("[csv-read] loaded rows=%s", len(rows))
     return rows
 
 
@@ -297,8 +393,7 @@ def write_csv_rows(container_client, blob_name: str, rows: List[Dict]) -> None:
         writer.writerow(r)
     data = buf.getvalue().encode("utf-8")
     blob_client.upload_blob(data, overwrite=True)
-    logging.info("[csv-write] uploaded rows=%s size=%s", len(rows), len(data))
-
+    dlog("[csv-write] uploaded rows=%s size=%s", len(rows), len(data))
 
 # -------------------- CSV tvorba dnešních řádků --------------------
 def build_active_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[Dict]:
@@ -347,23 +442,22 @@ def deactivate_todays_rows(existing: List[Dict], today_iso: str) -> int:
             changed += 1
     return changed
 
-
 # -------------------- Azure Function entrypoint --------------------
 def main(mytimer: func.TimerRequest) -> None:
     scrape_date = dt.datetime.now().date()
     load_ts = dt.datetime.now(dt.timezone.utc).isoformat()  # UTC čas zápisu
-    logging.info("[CoinDesk_Prediciction] Start %s", scrape_date.isoformat())
-    logging.info("[env] OUTPUT_CONTAINER=%s AZURE_BLOB_NAME=%s MAX_PAGES=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME, MAX_PAGES)
+    dlog("[CoinDesk_Prediciction] Start %s", scrape_date.isoformat())
+    dlog("[env] OUTPUT_CONTAINER=%s AZURE_BLOB_NAME=%s MAX_PAGES=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME, MAX_PAGES)
 
     if not STORAGE_CONNECTION_STRING:
         logging.error("[env] AzureWebJobsStorage is NOT set. Exiting.")
         return
 
     try:
-        # 1) Extrakce z více stránek (+ dedup)
+        # 1) Extrakce z více stránek (+ enrichment z detailů) a dedup
         items = iter_all_items()
         items = dedup_items_by_symbol(items)
-        logging.info("[extract] unique_symbols=%s", len(items))
+        dlog("[extract] unique_symbols=%s", len(items))
 
         # 2) Blob klient
         try:
@@ -377,20 +471,20 @@ def main(mytimer: func.TimerRequest) -> None:
         container_client = blob_service.get_container_client(OUTPUT_CONTAINER)
         try:
             container_client.create_container()
-            logging.info("[blob] container created: %s", OUTPUT_CONTAINER)
+            dlog("[blob] container created: %s", OUTPUT_CONTAINER)
         except Exception:
-            logging.info("[blob] container exists: %s", OUTPUT_CONTAINER)
+            dlog("[blob] container exists: %s", OUTPUT_CONTAINER)
 
         # 3) Načti existující CSV, deaktivuj dnešní True a přidej nové aktivní
         existing_rows = load_csv_rows(container_client, AZURE_BLOB_NAME)
         deactivated = deactivate_todays_rows(existing_rows, scrape_date.isoformat())
         new_active_rows = build_active_rows(scrape_date, load_ts, items)
         all_rows = existing_rows + new_active_rows
-        logging.info("[csv] deactivated_today=%s newly_active=%s final_rows=%s", deactivated, len(new_active_rows), len(all_rows))
+        dlog("[csv] deactivated_today=%s newly_active=%s final_rows=%s", deactivated, len(new_active_rows), len(all_rows))
 
         # 4) Zapiš celý CSV s overwrite=True
         write_csv_rows(container_client, AZURE_BLOB_NAME, all_rows)
-        logging.info("[done] Overwrite completed.")
+        dlog("[done] Overwrite completed.")
 
     except Exception as e:
         logging.error("[fatal] Unhandled exception in CoinDesk_Prediciction: %s", e)
