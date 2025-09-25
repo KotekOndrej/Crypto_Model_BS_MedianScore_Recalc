@@ -9,7 +9,7 @@ import io
 import csv
 import time
 import hashlib
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 
 import azure.functions as func
 import requests
@@ -20,12 +20,12 @@ from dateutil.relativedelta import relativedelta
 BASE_URL = "https://coincodex.com/predictions/"
 DETAIL_URL_TMPL = "https://coincodex.com/crypto/{slug}/price-prediction/"
 
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/3.3)")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/3.4)")
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
 AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "CoinDeskModels.csv")
 
-MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))          # hard stop pojistka
+MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))          # tvrdý limit pro jistotu
 PAGE_SLEEP_MS = int(os.getenv("PAGE_SLEEP_MS", "250")) # pauza mezi stránkami
 DETAIL_SLEEP_MS = int(os.getenv("DETAIL_SLEEP_MS", "100"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "45"))
@@ -61,6 +61,22 @@ def hash_text(text: str) -> str: return hashlib.sha256(text.encode("utf-8", erro
 def parse_decimal_safe(s: str) -> Optional[Decimal]:
     try: return Decimal(s)
     except: return None
+
+def get_current_page_from_url(url: str) -> int:
+    try:
+        qs = parse_qs(urlparse(url).query)
+        return int(qs.get("page", ["1"])[0]) or 1
+    except Exception:
+        return 1
+
+def build_url_with_page(base_url: str, page: int) -> str:
+    if page <= 1:
+        return base_url
+    parsed = urlparse(base_url)
+    q = parse_qs(parsed.query)
+    q["page"] = [str(page)]
+    new_query = urlencode(q, doseq=True)
+    return parsed._replace(query=new_query).geturl() or f"{base_url}?page={page}"
 
 # -------------------- Parser tabulky /predictions/ --------------------
 def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
@@ -147,39 +163,47 @@ def extract_table_rows(html: str) -> List[Dict]:
             })
     return rows
 
-# -------------------- Najdi “další stránku” v DOM --------------------
-def find_next_page_url(html: str, current_url: str) -> Optional[str]:
+# -------------------- Detekce dostupných čísel stránek --------------------
+_PAGE_HREF_RX = re.compile(r"/predictions/\?page=(\d+)", re.I)
+
+def find_available_pages(html: str, current_url: str) -> List[int]:
+    """Z HTML vyextrahuje všechna čísla stránek z href, např. ?page=1..10."""
     soup = BeautifulSoup(html, "html.parser")
-
-    # 1) rel="next"
-    a = soup.select_one('a[rel="next"]')
-    if a and a.get("href"):
-        return urljoin(current_url, a.get("href"))
-
-    # 2) typické pagination prvky: text "Next", "›", "»"
-    candidates = []
-    for link in soup.find_all("a"):
-        txt = (link.get_text() or "").strip().lower()
-        if txt in {"next", "›", "»"} and link.get("href"):
-            candidates.append(link.get("href"))
-    if candidates:
-        return urljoin(current_url, candidates[0])
-
-    # 3) poslední číslo +1 (fallback): najdi pagination blok a aktuální stránku
-    # Pokud najdeme <li class="active"><a>3</a></li>, vezmeme nejbližší <a> s číslem +1
-    pagers = soup.find_all(class_=re.compile("pagination|pager|pages", re.I))
-    for p in pagers:
-        nums = []
-        for link in p.find_all("a"):
-            t = (link.get_text() or "").strip()
-            if t.isdigit():
-                nums.append((int(t), link.get("href")))
-        if nums:
-            max_num = max(n for n, _ in nums)
-            # hledej odkaz na max_num+1
-            for n, href in nums:
+    pages = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        m = _PAGE_HREF_RX.search(href)
+        if m:
+            try:
+                pages.add(int(m.group(1)))
+            except:
                 pass
-            # někdy je "next" mimo čísla; když nic, vrať None
+    # fallback: zkus i textové odkazy s čísly (kdyby href neobsahoval ?page)
+    for a in soup.find_all("a"):
+        txt = (a.get_text() or "").strip()
+        if txt.isdigit():
+            try:
+                pages.add(int(txt))
+            except:
+                pass
+    pages_list = sorted(pages)
+    dlog("[pager] detected_pages=%s", pages_list)
+    return pages_list
+
+def compute_next_url(html: str, current_url: str) -> Optional[str]:
+    """Najde další URL podle detekovaných ?page=N odkazů."""
+    pages = find_available_pages(html, current_url)
+    if not pages:
+        return None
+    curr = get_current_page_from_url(current_url)
+    # preferuj nejbližší vyšší číslo
+    higher = [p for p in pages if p > curr]
+    if higher:
+        return build_url_with_page(BASE_URL, min(higher))
+    # když nejsou vyšší, ale vidíme max (např. 10), a jsme < max, posuň se o 1
+    max_p = max(pages)
+    if curr < max_p:
+        return build_url_with_page(BASE_URL, curr + 1)
     return None
 
 # -------------------- Detail coinu /price-prediction/ (enrichment) --------------------
@@ -225,7 +249,7 @@ def enrich_from_coin_detail(session: requests.Session, item: Dict) -> Dict:
     except Exception:
         return item
 
-# -------------------- Stahování stránek s následováním “Next” --------------------
+# -------------------- Stahování stránek s robustním stránkováním --------------------
 def crawl_all_items() -> List[Dict]:
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -234,7 +258,7 @@ def crawl_all_items() -> List[Dict]:
     seen_symbols = set()
     visited_hashes = set()
 
-    url = BASE_URL
+    url = BASE_URL  # začínáme na stránce 1
     for page_idx in range(1, MAX_PAGES + 1):
         try:
             resp = session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT)
@@ -268,11 +292,17 @@ def crawl_all_items() -> List[Dict]:
             added += 1
         dlog("[pager] page_idx=%s newly_added=%s total=%s", page_idx, added, len(all_items))
 
-        # najdi další URL z DOM
-        next_url = find_next_page_url(html, url)
+        # NOVÉ: dopočítej další URL z čísel stránek v HTML
+        next_url = compute_next_url(html, url)
         if not next_url:
-            dlog("[pager] no next link -> stop")
+            dlog("[pager] no next link (by href scan) -> stop")
             break
+
+        # sanity: když next_url == url, skonči
+        if next_url == url:
+            dlog("[pager] next_url equals current -> stop")
+            break
+
         url = next_url
 
         if added == 0:
@@ -282,7 +312,7 @@ def crawl_all_items() -> List[Dict]:
         if PAGE_SLEEP_MS > 0:
             time.sleep(PAGE_SLEEP_MS / 1000.0)
 
-    # Enrichment z detailů (volitelné; doplní chybějící predikce)
+    # Enrichment z detailů (volitelně doplní chybějící predikce)
     improved = 0
     for idx, it in enumerate(all_items):
         before = (it.get("pred_5d"), it.get("pred_1m"), it.get("pred_3m"), it.get("pred_6m"), it.get("pred_1y"))
@@ -381,9 +411,9 @@ def main(mytimer: func.TimerRequest) -> None:
         logging.error("[env] AzureWebJobsStorage is NOT set. Exiting."); return
 
     try:
-        # 1) Crawl: sleduj “Next” v DOM (ne ?page=N naslepo)
+        # 1) Crawl: robustní stránkování přes skenování href ?page=N
         items = crawl_all_items()
-        # safety dedup podle symbolu
+        # Safety dedup podle symbolu
         uniq = {}
         for it in items:
             s = it.get("symbol")
