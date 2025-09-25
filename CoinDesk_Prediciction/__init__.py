@@ -13,11 +13,11 @@ from dateutil.relativedelta import relativedelta
 
 # -------------------- Konfigurace --------------------
 COINCIDEX_BASE_URL = "https://coincodex.com/predictions/"
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/1.6)")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/2.0)")
 TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Prague")  # informativní
-STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # použij storage Function Appu
+STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # storage Function Appu
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
-AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "CoinDeskModels.csv")  # default požadovaný
+AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "CoinDeskModels.csv")  # výchozí název CSV
 MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
 
 HEADERS = {
@@ -36,12 +36,15 @@ HORIZON_MAP = {
     "1Y Prediction": ("1Y", lambda d: d + relativedelta(years=1)),
 }
 
-# CSV hlavička – append-only
-CSV_HEADER = "scrape_date,symbol,token_name,horizon,model_to,predicted_price,predicted_change_pct\n"
-
+# CSV hlavička – přidán current_price, load_ts, is_active, validation
+CSV_HEADER = (
+    "scrape_date,load_ts,symbol,token_name,current_price,horizon,model_to,"
+    "predicted_price,predicted_change_pct,is_active,validation\n"
+)
 
 # -------------------- Parser helpery --------------------
 def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    """Z buňky typu '$ 4,660.39 11.49%' vytáhne cenu (Decimal) a % změnu (Decimal)."""
     if not text:
         return None, None
     m_price = re.search(r"[-]?\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)", text)
@@ -63,7 +66,15 @@ def parse_price_and_change(text: str) -> Tuple[Optional[Decimal], Optional[Decim
 
 
 def extract_table_rows(html: str) -> List[Dict]:
+    """
+    Vrací list dictů:
+      {
+        symbol, token_name, current_price,
+        pred_5d, chg_5d, pred_1m, chg_1m, pred_3m, chg_3m, pred_6m, chg_6m, pred_1y, chg_1y
+      }
+    """
     soup = BeautifulSoup(html, "html.parser")
+
     table = None
     for t in soup.find_all("table"):
         headers = [th.get_text(strip=True) for th in t.find_all("th")]
@@ -75,6 +86,16 @@ def extract_table_rows(html: str) -> List[Dict]:
 
     header_texts = [th.get_text(strip=True) for th in table.find_all("th")]
     col_idx = {name: i for i, name in enumerate(header_texts)}
+
+    # Price sloupec (může být různě pojmenován, hledáme 'Price')
+    price_col_name = None
+    if "Price" in col_idx:
+        price_col_name = "Price"
+    else:
+        for h in header_texts:
+            if "Price" in h and h not in HORIZON_MAP:
+                price_col_name = h
+                break
 
     required = ["Name", "5D Prediction", "1M Prediction", "3M Prediction", "6M Prediction", "1Y Prediction"]
     if not all(r in col_idx for r in required):
@@ -90,6 +111,7 @@ def extract_table_rows(html: str) -> List[Dict]:
         if len(tds) < len(header_texts):
             continue
 
+        # Name: např. "ETH Ethereum"
         name_cell = tds[col_idx["Name"]]
         name_text = name_cell.get_text(" ", strip=True)
         symbol = None
@@ -113,6 +135,15 @@ def extract_table_rows(html: str) -> List[Dict]:
                 else:
                     token_name = atext
 
+        # Aktuální cena
+        current_price: Optional[Decimal] = None
+        if price_col_name:
+            try:
+                price_cell_text = tds[col_idx[price_col_name]].get_text(" ", strip=True)
+                current_price, _ = parse_price_and_change(price_cell_text)
+            except Exception:
+                current_price = None
+
         preds: Dict[str, Optional[Decimal]] = {}
         chgs: Dict[str, Optional[Decimal]] = {}
         for header in required[1:]:
@@ -125,6 +156,7 @@ def extract_table_rows(html: str) -> List[Dict]:
             rows.append({
                 "symbol": symbol,
                 "token_name": token_name or "",
+                "current_price": current_price,
                 "pred_5d": preds.get("5D Prediction"),
                 "chg_5d": chgs.get("5D Prediction"),
                 "pred_1m": preds.get("1M Prediction"),
@@ -168,11 +200,19 @@ def iter_all_pages(max_pages: int = MAX_PAGES):
         yield from rows
 
 
-def build_csv_rows(scrape_date: dt.date, items: List[Dict]) -> List[str]:
+# -------------------- CSV řádky --------------------
+def build_active_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[str]:
+    """
+    Aktivní záznamy (is_active=True) – 1 řádek na (token, horizont) s aktuální predikcí.
+    Poslední sloupec 'validation' je zatím prázdný.
+    """
     rows: List[str] = []
     for it in items:
         symbol = it["symbol"]
         token_name = it.get("token_name", "")
+        current_price = it.get("current_price")
+        current_price_str = "" if current_price is None else str(current_price)
+
         pairs = [
             ("5D", it.get("pred_5d"), it.get("chg_5d"), "5D Prediction"),
             ("1M", it.get("pred_1m"), it.get("chg_1m"), "1M Prediction"),
@@ -187,17 +227,46 @@ def build_csv_rows(scrape_date: dt.date, items: List[Dict]) -> List[str]:
             model_to = to_fn(scrape_date)
             pct_str = "" if pct is None else str(pct)
             rows.append(
-                f"{scrape_date.isoformat()},{symbol},{token_name},{label},{model_to.isoformat()},{price},{pct_str}\n"
+                f"{scrape_date.isoformat()},{load_ts},{symbol},{token_name},{current_price_str},"
+                f"{label},{model_to.isoformat()},{price},{pct_str},True,\n"
             )
     return rows
 
 
+def build_invalidation_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[str]:
+    """
+    Invalidační „tombstony“ (is_active=False) – pro každý (token, horizont) detekovaný v aktuálním běhu.
+    Neznáme předchozí predicted_price, ponecháme hodnoty prázdné (event-sourcing přístup).
+    Poslední sloupec 'validation' prázdný.
+    """
+    rows: List[str] = []
+    for it in items:
+        symbol = it["symbol"]
+        token_name = it.get("token_name", "")
+        for header_name, (label, to_fn) in HORIZON_MAP.items():
+            has_today = it.get({
+                "5D Prediction": "pred_5d",
+                "1M Prediction": "pred_1m",
+                "3M Prediction": "pred_3m",
+                "6M Prediction": "pred_6m",
+                "1Y Prediction": "pred_1y",
+            }[header_name]) is not None
+            if not has_today:
+                continue
+            model_to = to_fn(scrape_date)
+            rows.append(
+                f"{scrape_date.isoformat()},{load_ts},{symbol},{token_name},,"
+                f"{label},{model_to.isoformat()},,,False,\n"
+            )
+    return rows
+
+
+# -------------------- Blob zápis helpery --------------------
 def _append_blockblob_fallback(blob_client, header: str, lines: List[str]) -> None:
     """
     Fallback pro starší SDK bez AppendBlobClient:
     - pokud blob neexistuje -> vytvoř s hlavičkou + data
     - pokud existuje -> stáhni obsah, připoj nové řádky a nahraj s overwrite=True
-    Pozn.: pro běžné denní dávky je to naprosto OK.
     """
     from azure.core.exceptions import ResourceNotFoundError
 
@@ -207,7 +276,6 @@ def _append_blockblob_fallback(blob_client, header: str, lines: List[str]) -> No
         return
 
     try:
-        # stáhni existující obsah (pokud je)
         try:
             stream = blob_client.download_blob()
             existing = stream.readall()
@@ -217,10 +285,8 @@ def _append_blockblob_fallback(blob_client, header: str, lines: List[str]) -> No
             logging.info("[blob-fallback] blob does not exist, will create.")
 
         if not existing:
-            # vytvořit s hlavičkou
             payload = header.encode("utf-8") + new_payload
         else:
-            # zkontroluj, zda už má hlavičku
             if not existing.startswith(header.encode("utf-8")):
                 payload = header.encode("utf-8") + existing + new_payload
             else:
@@ -250,6 +316,7 @@ def _append_in_chunks_appendblob(append_client, lines: List[str], max_chunk_byte
 # -------------------- Azure Function entrypoint --------------------
 def main(mytimer: func.TimerRequest) -> None:
     scrape_date = dt.datetime.now().date()
+    load_ts = dt.datetime.now(dt.timezone.utc).isoformat()  # UTC čas zápisu
     logging.info("[CoinDesk_Prediciction] Start %s", scrape_date.isoformat())
     logging.info("[env] OUTPUT_CONTAINER=%s AZURE_BLOB_NAME=%s MAX_PAGES=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME, MAX_PAGES)
 
@@ -261,8 +328,16 @@ def main(mytimer: func.TimerRequest) -> None:
         all_items = list(iter_all_pages())
         logging.info("[extract] total_items=%s", len(all_items))
 
-        csv_lines = build_csv_rows(scrape_date, all_items)
-        logging.info("[csv] lines_to_append=%s", len(csv_lines))
+        # 1) Tombstony (zneplatnit dnešní starší běhy) -> False
+        invalidate_rows = build_invalidation_rows(scrape_date, load_ts, all_items)
+        # 2) Aktivní záznamy -> True
+        active_rows = build_active_rows(scrape_date, load_ts, all_items)
+        # 3) Pořadí: invalidace -> nové aktivní
+        csv_lines = invalidate_rows + active_rows
+        logging.info(
+            "[csv] invalidate_rows=%s active_rows=%s total_to_append=%s",
+            len(invalidate_rows), len(active_rows), len(csv_lines)
+        )
 
         # Blob klient – bez tvrdé závislosti na AppendBlobClient
         try:
@@ -281,7 +356,7 @@ def main(mytimer: func.TimerRequest) -> None:
             except Exception:
                 logging.info("[blob] container exists: %s", OUTPUT_CONTAINER)
 
-            # Zkusíme použít AppendBlobClient, pokud je k dispozici
+            # Zkusíme AppendBlobClient, pokud je k dispozici
             try:
                 from azure.storage.blob import AppendBlobClient
                 append_client = AppendBlobClient.from_connection_string(
@@ -293,6 +368,7 @@ def main(mytimer: func.TimerRequest) -> None:
                     append_client.create_blob()
                     append_client.append_block(CSV_HEADER.encode("utf-8"))
                     logging.info("[blob] created append blob + header written")
+
                 if csv_lines:
                     _append_in_chunks_appendblob(append_client, csv_lines)
                     logging.info("[blob] append completed via AppendBlobClient: %s rows", len(csv_lines))
