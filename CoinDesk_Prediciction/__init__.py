@@ -7,6 +7,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Tuple, List, Dict, Optional
 import io
 import csv
+import time
+import hashlib
 
 import azure.functions as func
 import requests
@@ -15,13 +17,14 @@ from dateutil.relativedelta import relativedelta
 
 # -------------------- Konfigurace --------------------
 COINCIDEX_BASE_URL = "https://coincodex.com/predictions/"
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/3.0)")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/3.1)")
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # storage Function Appu
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
 AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "CoinDeskModels.csv")  # výchozí název CSV
 
-# CoinCodex serverově vrací jen 1. stránku; další „stránky“ jsou přes JS.
-MAX_PAGES = int(os.getenv("MAX_PAGES", "1"))  # necháme konfigurovatelné, ale reálně 1
+# Stránkování: zkusíme page=1..MAX_PAGES; zastavíme, když nic nepřibývá
+MAX_PAGES = int(os.getenv("MAX_PAGES", "20"))
+PAGE_SLEEP_MS = int(os.getenv("PAGE_SLEEP_MS", "0"))  # např. 200–500 ms pokud by web škrtal
 
 HEADERS = {
     "User-Agent": USER_AGENT,
@@ -176,11 +179,15 @@ def extract_table_rows(html: str) -> List[Dict]:
     return rows
 
 
-def fetch_predictions_page() -> Optional[str]:
-    url = COINCIDEX_BASE_URL  # reálně jen první stránka
+def fetch_predictions_page(page: int) -> Optional[str]:
+    """
+    Zkusí načíst stránku s parametrem ?page=N. Pro page=1 použij základní URL.
+    Některé verze webu vrací stále první stránku — ošetříme v iterátoru.
+    """
+    url = COINCIDEX_BASE_URL if page == 1 else f"{COINCIDEX_BASE_URL}?page={page}"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=45)
-        logging.info("[fetch] status=%s len=%s", resp.status_code, len(resp.text))
+        logging.info("[fetch] page=%s status=%s len=%s", page, resp.status_code, len(resp.text))
         if resp.status_code == 200:
             return resp.text
         logging.warning("[fetch] Non-200 status for %s: %s", url, resp.status_code)
@@ -189,18 +196,62 @@ def fetch_predictions_page() -> Optional[str]:
     return None
 
 
+def hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
 def iter_all_items() -> List[Dict]:
-    html = fetch_predictions_page()
-    if not html:
-        logging.info("[pager] No HTML for page 1.")
-        return []
-    rows = extract_table_rows(html)
-    logging.info("[pager] page=1 extracted_rows=%s", len(rows))
-    return rows
+    """
+    Iteruje stránkami ?page=1..MAX_PAGES, agreguje a deduplikuje tokeny.
+    Zastaví se, pokud:
+      - extract_table_rows vrátí 0 řádků, nebo
+      - hash HTML je stejný jako u předchozí stránky (pravděpodobně pořád 1. stránka), nebo
+      - nově přidané tokeny = 0 (už nic nepřibývá).
+    """
+    all_items: List[Dict] = []
+    seen_symbols = set()
+    prev_hash = None
+
+    for page in range(1, MAX_PAGES + 1):
+        html = fetch_predictions_page(page)
+        if not html:
+            logging.info("[pager] empty html, stop at page %s", page)
+            break
+
+        h = hash_text(html)
+        if prev_hash is not None and h == prev_hash:
+            logging.info("[pager] html identical to previous page (%s==%s), stop.", page, page-1)
+            break
+        prev_hash = h
+
+        rows = extract_table_rows(html)
+        logging.info("[pager] page=%s extracted_rows=%s", page, len(rows))
+        if not rows:
+            logging.info("[pager] no rows on page %s, stop.", page)
+            break
+
+        added = 0
+        for it in rows:
+            sym = it.get("symbol")
+            if not sym or sym in seen_symbols:
+                continue
+            seen_symbols.add(sym)
+            all_items.append(it)
+            added += 1
+
+        logging.info("[pager] page=%s newly_added_symbols=%s total_symbols=%s", page, added, len(all_items))
+        if added == 0:
+            logging.info("[pager] no new symbols, stop.")
+            break
+
+        if PAGE_SLEEP_MS > 0:
+            time.sleep(PAGE_SLEEP_MS / 1000.0)
+
+    return all_items
 
 
 def dedup_items_by_symbol(items: List[Dict]) -> List[Dict]:
-    """Odstraní duplicitní tokeny podle 'symbol'. Poslední výskyt vyhrává."""
+    """Bezpečnostní deduplikace podle 'symbol' (poslední výskyt vyhrává)."""
     uniq: Dict[str, Dict] = {}
     for it in items:
         sym = it.get("symbol")
@@ -228,7 +279,6 @@ def load_csv_rows(container_client, blob_name: str) -> List[Dict]:
     with io.StringIO(content) as f:
         reader = csv.DictReader(f)
         for r in reader:
-            # Normalizuj chybějící sloupce
             out = {k: r.get(k, "") for k in CSV_FIELDS}
             rows.append(out)
     logging.info("[csv-read] loaded rows=%s", len(rows))
@@ -242,7 +292,6 @@ def write_csv_rows(container_client, blob_name: str, rows: List[Dict]) -> None:
     writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS, lineterminator="\n", extrasaction="ignore")
     writer.writeheader()
     for r in rows:
-        # Zajistit, že všechny klíče existují
         for k in CSV_FIELDS:
             r.setdefault(k, "")
         writer.writerow(r)
@@ -311,10 +360,10 @@ def main(mytimer: func.TimerRequest) -> None:
         return
 
     try:
-        # 1) Extrakce
-        raw_items = iter_all_items()
-        items = dedup_items_by_symbol(raw_items)
-        logging.info("[extract] total_items=%s unique_symbols=%s", len(raw_items), len(items))
+        # 1) Extrakce z více stránek (+ dedup)
+        items = iter_all_items()
+        items = dedup_items_by_symbol(items)
+        logging.info("[extract] unique_symbols=%s", len(items))
 
         # 2) Blob klient
         try:
@@ -332,7 +381,7 @@ def main(mytimer: func.TimerRequest) -> None:
         except Exception:
             logging.info("[blob] container exists: %s", OUTPUT_CONTAINER)
 
-        # 3) Načti existující CSV, zneaktivni dnešní řádky a přidej nové aktivní
+        # 3) Načti existující CSV, deaktivuj dnešní True a přidej nové aktivní
         existing_rows = load_csv_rows(container_client, AZURE_BLOB_NAME)
         deactivated = deactivate_todays_rows(existing_rows, scrape_date.isoformat())
         new_active_rows = build_active_rows(scrape_date, load_ts, items)
