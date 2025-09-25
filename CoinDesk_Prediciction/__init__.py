@@ -13,12 +13,14 @@ from dateutil.relativedelta import relativedelta
 
 # -------------------- Konfigurace --------------------
 COINCIDEX_BASE_URL = "https://coincodex.com/predictions/"
-USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/2.0)")
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/2.1)")
 TIMEZONE = os.getenv("APP_TIMEZONE", "Europe/Prague")  # informativní
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # storage Function Appu
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "predictions")
 AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "CoinDeskModels.csv")  # výchozí název CSV
-MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
+
+# DŮLEŽITÉ: CoinCodex serverově vrací jen 1. stránku; další jsou JS. Nezkoušej nic >1.
+MAX_PAGES = int(os.getenv("MAX_PAGES", "1"))
 
 HEADERS = {
     "User-Agent": USER_AGENT,
@@ -36,7 +38,7 @@ HORIZON_MAP = {
     "1Y Prediction": ("1Y", lambda d: d + relativedelta(years=1)),
 }
 
-# CSV hlavička – přidán current_price, load_ts, is_active, validation
+# CSV hlavička – current_price, load_ts, is_active, validation
 CSV_HEADER = (
     "scrape_date,load_ts,symbol,token_name,current_price,horizon,model_to,"
     "predicted_price,predicted_change_pct,is_active,validation\n"
@@ -172,38 +174,51 @@ def extract_table_rows(html: str) -> List[Dict]:
 
 
 def fetch_predictions_page(page: Optional[int] = None) -> Optional[str]:
-    url = COINCIDEX_BASE_URL if not page or page == 1 else f"{COINCIDEX_BASE_URL}?page={page}"
-    for attempt in range(1, 3):
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=45)
-            logging.info("[fetch] page=%s status=%s len=%s attempt=%s", page or 1, resp.status_code, len(resp.text), attempt)
-            if resp.status_code == 200:
-                return resp.text
-            else:
-                logging.warning("[fetch] Non-200 status for %s: %s", url, resp.status_code)
-        except Exception as e:
-            logging.warning("[fetch] Error on %s (attempt %s): %s", url, attempt, e)
+    # Reálně používáme jen page=1; další stránky přes JS nejsou serverově k dispozici.
+    url = COINCIDEX_BASE_URL
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=45)
+        logging.info("[fetch] status=%s len=%s", resp.status_code, len(resp.text))
+        if resp.status_code == 200:
+            return resp.text
+        logging.warning("[fetch] Non-200 status for %s: %s", url, resp.status_code)
+    except Exception as e:
+        logging.warning("[fetch] Error on %s: %s", url, e)
     return None
 
 
 def iter_all_pages(max_pages: int = MAX_PAGES):
-    for p in range(1, max_pages + 1):
-        html = fetch_predictions_page(p)
-        if not html:
-            logging.info("[pager] No HTML for page %s, stop.", p)
-            break
-        rows = extract_table_rows(html)
-        logging.info("[pager] page=%s extracted_rows=%s", p, len(rows))
-        if not rows:
-            logging.info("[pager] Empty rows on page %s, stop.", p)
-            break
-        yield from rows
+    """
+    Vědomě stahujeme jen 1. stránku – server vrací pouze top 10 záznamů.
+    """
+    html = fetch_predictions_page(1)
+    if not html:
+        logging.info("[pager] No HTML for page 1.")
+        return
+    rows = extract_table_rows(html)
+    logging.info("[pager] page=1 extracted_rows=%s", len(rows))
+    for r in rows:
+        yield r
+
+
+# -------------------- Dedup --------------------
+def dedup_items_by_symbol(items: List[Dict]) -> List[Dict]:
+    """
+    Odstraní duplicitní tokeny podle 'symbol'. Poslední výskyt vyhrává.
+    """
+    uniq: Dict[str, Dict] = {}
+    for it in items:
+        sym = it.get("symbol")
+        if not sym:
+            continue
+        uniq[sym] = it
+    return list(uniq.values())
 
 
 # -------------------- CSV řádky --------------------
 def build_active_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[str]:
     """
-    Aktivní záznamy (is_active=True) – 1 řádek na (token, horizont) s aktuální predikcí.
+    Aktivní záznamy (is_active=True) – 1 řádek na (symbol, horizont) s aktuální predikcí.
     Poslední sloupec 'validation' je zatím prázdný.
     """
     rows: List[str] = []
@@ -235,24 +250,29 @@ def build_active_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> 
 
 def build_invalidation_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[str]:
     """
-    Invalidační „tombstony“ (is_active=False) – pro každý (token, horizont) detekovaný v aktuálním běhu.
-    Neznáme předchozí predicted_price, ponecháme hodnoty prázdné (event-sourcing přístup).
-    Poslední sloupec 'validation' prázdný.
+    Invalidační „tombstony“ (is_active=False) – max 1× na (symbol, horizon) v rámci běhu.
+    Neznáme předchozí predicted_price -> hodnoty necháme prázdné.
     """
     rows: List[str] = []
+    seen = set()  # (symbol, label)
     for it in items:
         symbol = it["symbol"]
         token_name = it.get("token_name", "")
         for header_name, (label, to_fn) in HORIZON_MAP.items():
-            has_today = it.get({
+            # invaliduj jen horizonty, pro které dnes máme predikci
+            col = {
                 "5D Prediction": "pred_5d",
                 "1M Prediction": "pred_1m",
                 "3M Prediction": "pred_3m",
                 "6M Prediction": "pred_6m",
                 "1Y Prediction": "pred_1y",
-            }[header_name]) is not None
-            if not has_today:
+            }[header_name]
+            if it.get(col) is None:
                 continue
+            key = (symbol, label)
+            if key in seen:
+                continue
+            seen.add(key)
             model_to = to_fn(scrape_date)
             rows.append(
                 f"{scrape_date.isoformat()},{load_ts},{symbol},{token_name},,"
@@ -325,13 +345,14 @@ def main(mytimer: func.TimerRequest) -> None:
         return
 
     try:
-        all_items = list(iter_all_pages())
-        logging.info("[extract] total_items=%s", len(all_items))
+        raw_items = list(iter_all_pages())
+        items = dedup_items_by_symbol(raw_items)
+        logging.info("[extract] total_items=%s unique_symbols=%s", len(raw_items), len(items))
 
-        # 1) Tombstony (zneplatnit dnešní starší běhy) -> False
-        invalidate_rows = build_invalidation_rows(scrape_date, load_ts, all_items)
+        # 1) Tombstony (zneplatnit dnešní starší běhy) -> False (max 1× na (symbol, horizon))
+        invalidate_rows = build_invalidation_rows(scrape_date, load_ts, items)
         # 2) Aktivní záznamy -> True
-        active_rows = build_active_rows(scrape_date, load_ts, all_items)
+        active_rows = build_active_rows(scrape_date, load_ts, items)
         # 3) Pořadí: invalidace -> nové aktivní
         csv_lines = invalidate_rows + active_rows
         logging.info(
