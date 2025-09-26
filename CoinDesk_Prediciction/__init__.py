@@ -12,12 +12,18 @@ import hashlib
 from urllib.parse import urlparse, parse_qs, urlencode, urljoin
 
 import azure.functions as func
-import requests
-from bs4 import BeautifulSoup
-from dateutil.relativedelta import relativedelta
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    from dateutil.relativedelta import relativedelta
+except Exception as e:
+    # Když selže import, logni a vyhoď znovu, aby byl vidět důvod
+    logging.error("[import] Failed to import libs: %s", e)
+    raise
 
 # ===================== Konfigurace a konstanty =====================
-VERSION = "4.3-router"
+VERSION = "4.3.1-router"
 
 # Zdroj scrapu: COIN_LIST | PREDICTIONS | HYBRID
 SCRAPE_SOURCE = os.getenv("SCRAPE_SOURCE", "COIN_LIST").upper()
@@ -47,7 +53,7 @@ SEED_SLUGS = [s.strip() for s in os.getenv("SEED_SLUGS", "").split(",") if s.str
 DEBUG_SAVE_HTML = os.getenv("DEBUG_SAVE_HTML", "0") == "1"
 
 HEADERS = {
-    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/4.3)"),
+    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/4.3.1)"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -71,7 +77,8 @@ CSV_FIELDS = [
 ]
 
 # ===================== Util a parsování =====================
-def dlog(msg, *args): logging.info(msg, *args)
+def dlog(msg, *args) -> None:
+    logging.info(msg, *args)
 
 def hash_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
@@ -100,14 +107,15 @@ def build_url_with_page(base_url: str, page: int) -> str:
     new_query = urlencode(q, doseq=True)
     return parsed._replace(query=new_query).geturl() or f"{base_url}?page={page}"
 
-# ===================== PREDICTIONS index (primárně 1. stránka, + pokusy o další) =====================
+# ===================== PREDICTIONS index =====================
 def extract_table_rows_from_predictions(html: str) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
     table = None
     for t in soup.find_all("table"):
         headers = [th.get_text(strip=True) for th in t.find_all("th")]
         if any(("5D" in h and "Prediction" in h) for h in headers):
-            table = t; break
+            table = t
+            break
     if not table:
         return []
 
@@ -124,14 +132,16 @@ def extract_table_rows_from_predictions(html: str) -> List[Dict]:
     rows: List[Dict] = []
     for tr in tbody.find_all("tr"):
         tds = tr.find_all("td")
-        if len(tds) < len(header_texts): continue
+        if len(tds) < len(header_texts):
+            continue
         name_cell = tds[col_idx["Name"]]
         name_text = name_cell.get_text(" ", strip=True)
         symbol, token_name, slug = None, None, None
         a = name_cell.find("a")
         if a and a.get("href"):
             m = re.search(r"/crypto/([^/]+)/?", a.get("href"))
-            if m: slug = m.group(1).strip()
+            if m:
+                slug = m.group(1).strip()
         if name_text:
             parts = name_text.split()
             if len(parts) >= 2:
@@ -177,52 +187,67 @@ def extract_table_rows_from_predictions(html: str) -> List[Dict]:
 _PAGE_RX = re.compile(r"/predictions/\?page=(\d+)", re.I)
 
 def crawl_predictions_index() -> List[Dict]:
-    session = requests.Session(); session.headers.update(HEADERS)
-    all_items: List[Dict] = []; seen = set(); visited = set()
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    all_items: List[Dict] = []
+    seen = set()
+    visited = set()
     url = PREDICTIONS_INDEX
     for i in range(1, MAX_PAGES + 1):
         try:
-            resp = session.get(url, timeout=HTTP_TIMEOUT); html = resp.text
+            resp = session.get(url, timeout=HTTP_TIMEOUT)
+            html = resp.text
             dlog("[pred] url=%s status=%s len=%s", url, resp.status_code, len(html))
-            if resp.status_code != 200: break
+            if resp.status_code != 200:
+                break
         except Exception as e:
-            dlog("[pred] error %s: %s", url, e); break
+            dlog("[pred] error %s: %s", url, e)
+            break
         h = hash_text(html)
         if h in visited:
-            dlog("[pred] duplicate hash -> stop"); break
+            dlog("[pred] duplicate hash -> stop")
+            break
         visited.add(h)
         rows = extract_table_rows_from_predictions(html)
-        if not rows: dlog("[pred] no rows -> stop"); break
+        if not rows:
+            dlog("[pred] no rows -> stop")
+            break
         added = 0
         for it in rows:
             s = it.get("symbol")
             if s and s not in seen:
-                seen.add(s); all_items.append(it); added += 1
+                seen.add(s)
+                all_items.append(it)
+                added += 1
         dlog("[pred] page=%s newly_added=%s total=%s", i, added, len(all_items))
-        # zkus najít další stránku v HTML
+        # hledej next
         soup = BeautifulSoup(html, "html.parser")
         next_href = None
         a_rel = soup.select_one('a[rel="next"]')
-        if a_rel and a_rel.get("href"): next_href = a_rel["href"]
+        if a_rel and a_rel.get("href"):
+            next_href = a_rel["href"]
         if not next_href:
-            # fallback: hledej nejbližší vyšší ?page=
             pages = set()
             for a in soup.find_all("a", href=True):
-                m = _PAGE_RX.search(a["href"]); 
+                m = _PAGE_RX.search(a["href"])
                 if m:
-                    try: pages.add(int(m.group(1)))
-                    except: pass
+                    try:
+                        pages.add(int(m.group(1)))
+                    except Exception:
+                        pass
             curr = int(parse_qs(urlparse(url).query).get("page", ["1"])[0])
             higher = sorted([p for p in pages if p > curr])
-            if higher: next_href = f"/predictions/?page={higher[0]}"
+            if higher:
+                next_href = f"/predictions/?page={higher[0]}"
         if not next_href:
-            # forced ?page=2..N
-            forced = build_url_with_page(PREDICTIONS_INDEX, i+1)
+            forced = build_url_with_page(PREDICTIONS_INDEX, i + 1)
             test = session.get(forced, timeout=HTTP_TIMEOUT)
             dlog("[pred-forced] %s status=%s len=%s", forced, test.status_code, len(test.text))
-            if test.status_code != 200: break
+            if test.status_code != 200:
+                break
             th = hash_text(test.text)
-            if th in visited: break
+            if th in visited:
+                break
             if extract_table_rows_from_predictions(test.text):
                 url = forced
             else:
@@ -251,27 +276,37 @@ def fetch_coin_list_page(session: requests.Session, page: int) -> Optional[str]:
 
 def extract_slugs_generic(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
-    slugs = []; seen = set()
+    slugs: List[str] = []
+    seen = set()
     for a in soup.find_all("a", href=True):
         m = _SLUG_RX.match(a["href"])
-        if not m: continue
+        if not m:
+            continue
         slug = m.group(1).lower()
         if slug not in seen:
-            seen.add(slug); slugs.append(slug)
+            seen.add(slug)
+            slugs.append(slug)
     return slugs
 
 def collect_coin_slugs(max_pages: int, max_coins: int) -> List[Dict]:
-    session = requests.Session(); session.headers.update(HEADERS)
-    out: List[Dict] = []; seen = set()
-    # manuální seedy jako první
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    out: List[Dict] = []
+    seen = set()
+
+    # manuální seedy (volitelně)
     if SEED_SLUGS:
         for s in SEED_SLUGS:
             if s not in seen:
-                seen.add(s); out.append({"slug": s})
+                seen.add(s)
+                out.append({"slug": s})
+
     for p in range(1, max_pages + 1):
-        if len(out) >= max_coins: break
+        if len(out) >= max_coins:
+            break
         html = fetch_coin_list_page(session, p)
-        if not html: break
+        if not html:
+            break
         if DEBUG_SAVE_HTML and p <= 2:
             try:
                 from azure.storage.blob import BlobServiceClient
@@ -285,11 +320,16 @@ def collect_coin_slugs(max_pages: int, max_coins: int) -> List[Dict]:
         added = 0
         for s in slugs:
             if s not in seen:
-                seen.add(s); out.append({"slug": s}); added += 1
-                if len(out) >= max_coins: break
+                seen.add(s)
+                out.append({"slug": s})
+                added += 1
+                if len(out) >= max_coins:
+                    break
         dlog("[list] page=%s added=%s total=%s", p, added, len(out))
-        if added == 0: break
-        if PAGE_SLEEP_MS > 0: time.sleep(PAGE_SLEEP_MS / 1000.0)
+        if added == 0:
+            break
+        if PAGE_SLEEP_MS > 0:
+            time.sleep(PAGE_SLEEP_MS / 1000.0)
     return out[:max_coins]
 
 def fetch_prediction_detail(session: requests.Session, slug: str) -> Optional[str]:
@@ -307,7 +347,7 @@ def parse_prediction_detail(html: str) -> Dict[str, Optional[Decimal]]:
     soup = BeautifulSoup(html, "html.parser")
     # symbol & name
     symbol, token_name = None, None
-    h = soup.find(["h1","h2"])
+    h = soup.find(["h1", "h2"])
     if h:
         t = h.get_text(" ", strip=True)
         m = _SYMBOL_NAME_RX.match(t)
@@ -315,15 +355,18 @@ def parse_prediction_detail(html: str) -> Dict[str, Optional[Decimal]]:
             symbol, token_name = m.group(1), m.group(2)
     if not symbol and soup.title:
         m = _TITLE_RX.match(soup.title.get_text(" ", strip=True))
-        if m: symbol, token_name = m.group(1), m.group(2)
+        if m:
+            symbol, token_name = m.group(1), m.group(2)
     if not symbol:
         badge = soup.find(class_=re.compile(r"(cc-symbol|ticker|symbol)", re.I))
         if badge:
             s = (badge.get_text() or "").strip().upper()
-            if 2 <= len(s) <= 10: symbol = s
+            if 2 <= len(s) <= 10:
+                symbol = s
     if not symbol and soup.title:
         first = soup.title.get_text().split()[0].upper()
-        if 2 <= len(first) <= 10 and first.isalnum(): symbol = first
+        if 2 <= len(first) <= 10 and first.isalnum():
+            symbol = first
 
     # current price (volitelné)
     current_price = None
@@ -334,49 +377,75 @@ def parse_prediction_detail(html: str) -> Dict[str, Optional[Decimal]]:
         current_price = cp or current_price
 
     def find_row(rx: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        node = soup.find(string=re.compile(rx, re.I)) or soup.find("th", string=re.compile(rx, re.I))
-        if not node: return None, None
+        node = soup.find(string=re.compile(rx, re.I))
+        if not node:
+            node = soup.find("th", string=re.compile(rx, re.I))
+        if not node:
+            return None, None
         node_parent = node.parent if hasattr(node, "parent") else None
         text = node_parent.get_text(" ", strip=True) if node_parent else str(node)
         return parse_price_and_change(text)
 
-    mapping = [("5D","5[-\\s]?Day"),("1M","1[-\\s]?Month"),("3M","3[-\\s]?Month"),("6M","6[-\\s]?Month"),("1Y","1[-\\s]?Year")]
+    mapping = [
+        ("5D", "5[-\\s]?Day"),
+        ("1M", "1[-\\s]?Month"),
+        ("3M", "3[-\\s]?Month"),
+        ("6M", "6[-\\s]?Month"),
+        ("1Y", "1[-\\s]?Year"),
+    ]
     result: Dict[str, Optional[Decimal]] = {
         "symbol": symbol, "token_name": token_name or "", "current_price": current_price,
-        "pred_5d": None, "chg_5d": None, "pred_1m": None, "chg_1m": None,
-        "pred_3m": None, "chg_3m": None, "pred_6m": None, "chg_6m": None,
+        "pred_5d": None, "chg_5d": None,
+        "pred_1m": None, "chg_1m": None,
+        "pred_3m": None, "chg_3m": None,
+        "pred_6m": None, "chg_6m": None,
         "pred_1y": None, "chg_1y": None,
     }
-    label_to_key = {"5D":("pred_5d","chg_5d"), "1M":("pred_1m","chg_1m"),
-                    "3M":("pred_3m","chg_3m"), "6M":("pred_6m","chg_6m"), "1Y":("pred_1y","chg_1y")}
+    label_to_key = {
+        "5D": ("pred_5d", "chg_5d"),
+        "1M": ("pred_1m", "chg_1m"),
+        "3M": ("pred_3m", "chg_3m"),
+        "6M": ("pred_6m", "chg_6m"),
+        "1Y": ("pred_1y", "chg_1y"),
+    }
     for short, rx in mapping:
         price, pct = find_row(rx)
         k_price, k_chg = label_to_key[short]
-        if price is not None: result[k_price] = price
-        if pct   is not None: result[k_chg] = pct
+        if price is not None:
+            result[k_price] = price
+        if pct is not None:
+            result[k_chg] = pct
     return result
 
 def collect_predictions_from_details(seed: List[Dict]) -> List[Dict]:
-    session = requests.Session(); session.headers.update(HEADERS)
+    session = requests.Session()
+    session.headers.update(HEADERS)
     out: List[Dict] = []
     for i, c in enumerate(seed, start=1):
         if i > MAX_COINS:
-            dlog("[detail] reached MAX_COINS=%s", MAX_COINS); break
-        slug = c.get("slug"); if not slug: continue
+            dlog("[detail] reached MAX_COINS=%s", MAX_COINS)
+            break
+        slug = c.get("slug")
+        if not slug:
+            continue
         html = fetch_prediction_detail(session, slug)
-        if not html: continue
+        if not html:
+            continue
         p = parse_prediction_detail(html)
-        has_any = any(p.get(k) is not None for k in ["pred_5d","pred_1m","pred_3m","pred_6m","pred_1y"])
+        has_any = any(p.get(k) is not None for k in ["pred_5d", "pred_1m", "pred_3m", "pred_6m", "pred_1y"])
         if p.get("symbol") and has_any:
             out.append({
-                "symbol": p["symbol"], "token_name": p.get("token_name",""), "current_price": p.get("current_price"),
+                "symbol": p["symbol"],
+                "token_name": p.get("token_name", ""),
+                "current_price": p.get("current_price"),
                 "pred_5d": p.get("pred_5d"), "chg_5d": p.get("chg_5d"),
                 "pred_1m": p.get("pred_1m"), "chg_1m": p.get("chg_1m"),
                 "pred_3m": p.get("pred_3m"), "chg_3m": p.get("chg_3m"),
                 "pred_6m": p.get("pred_6m"), "chg_6m": p.get("chg_6m"),
                 "pred_1y": p.get("pred_1y"), "chg_1y": p.get("chg_1y"),
             })
-        if DETAIL_SLEEP_MS > 0: time.sleep(DETAIL_SLEEP_MS / 1000.0)
+        if DETAIL_SLEEP_MS > 0:
+            time.sleep(DETAIL_SLEEP_MS / 1000.0)
     dlog("[detail] collected_items=%s (from seeds=%s)", len(out), len(seed))
     return out
 
@@ -389,7 +458,8 @@ def load_csv_rows(container_client, blob_name: str) -> List[Dict]:
     except ResourceNotFoundError:
         return []
     except Exception as e:
-        logging.warning("[csv-read] Failed to read existing blob: %s", e); return []
+        logging.warning("[csv-read] Failed to read existing blob: %s", e)
+        return []
     rows: List[Dict] = []
     with io.StringIO(content) as f:
         reader = csv.DictReader(f)
@@ -404,7 +474,8 @@ def write_csv_rows(container_client, blob_name: str, rows: List[Dict]) -> None:
     writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS, lineterminator="\n", extrasaction="ignore")
     writer.writeheader()
     for r in rows:
-        for k in CSV_FIELDS: r.setdefault(k, "")
+        for k in CSV_FIELDS:
+            r.setdefault(k, "")
         writer.writerow(r)
     data = buf.getvalue().encode("utf-8")
     blob.upload_blob(data, overwrite=True)
@@ -413,15 +484,20 @@ def write_csv_rows(container_client, blob_name: str, rows: List[Dict]) -> None:
 def build_active_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[Dict]:
     rows: List[Dict] = []
     for it in items:
-        symbol = it["symbol"]; token_name = it.get("token_name","")
-        cp = it.get("current_price"); cp_str = "" if cp is None else str(cp)
-        pairs = [("5D", it.get("pred_5d"), it.get("chg_5d")),
-                 ("1M", it.get("pred_1m"), it.get("chg_1m")),
-                 ("3M", it.get("pred_3m"), it.get("chg_3m")),
-                 ("6M", it.get("pred_6m"), it.get("chg_6m")),
-                 ("1Y", it.get("pred_1y"), it.get("chg_1y"))]
+        symbol = it["symbol"]
+        token_name = it.get("token_name", "")
+        cp = it.get("current_price")
+        cp_str = "" if cp is None else str(cp)
+        pairs = [
+            ("5D", it.get("pred_5d"), it.get("chg_5d")),
+            ("1M", it.get("pred_1m"), it.get("chg_1m")),
+            ("3M", it.get("pred_3m"), it.get("chg_3m")),
+            ("6M", it.get("pred_6m"), it.get("chg_6m")),
+            ("1Y", it.get("pred_1y"), it.get("chg_1y")),
+        ]
         for short, price, pct in pairs:
-            if price is None: continue
+            if price is None:
+                continue
             _, to_fn = HORIZON_MAP[short]
             model_to = to_fn(scrape_date)
             rows.append({
@@ -443,7 +519,8 @@ def deactivate_todays_rows(existing: List[Dict], today_iso: str) -> int:
     changed = 0
     for r in existing:
         if r.get("scrape_date") == today_iso and str(r.get("is_active")).strip().lower() == "true":
-            r["is_active"] = "False"; changed += 1
+            r["is_active"] = "False"
+            changed += 1
     return changed
 
 # ===================== MAIN =====================
@@ -455,14 +532,16 @@ def main(mytimer: func.TimerRequest) -> None:
     dlog("[env] OUTPUT_CONTAINER=%s AZURE_BLOB_NAME=%s", OUTPUT_CONTAINER, AZURE_BLOB_NAME)
 
     if not STORAGE_CONNECTION_STRING:
-        logging.error("[env] AzureWebJobsStorage is NOT set. Exiting."); return
+        logging.error("[env] AzureWebJobsStorage is NOT set. Exiting.")
+        return
 
     try:
         from azure.storage.blob import BlobServiceClient
         bsc = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         cc = bsc.get_container_client(OUTPUT_CONTAINER)
         try:
-            cc.create_container(); dlog("[blob] container created: %s", OUTPUT_CONTAINER)
+            cc.create_container()
+            dlog("[blob] container created: %s", OUTPUT_CONTAINER)
         except Exception:
             dlog("[blob] container exists: %s", OUTPUT_CONTAINER)
 
@@ -476,35 +555,39 @@ def main(mytimer: func.TimerRequest) -> None:
                     dlog("[list] using SEED_SLUGS fallback: %s", len(SEED_SLUGS))
                     seed = [{"slug": s} for s in SEED_SLUGS]
                 else:
-                    dlog("[list] no seeds -> stop"); return
+                    dlog("[list] no seeds -> stop")
+                    return
             items = collect_predictions_from_details(seed)
 
         elif SCRAPE_SOURCE == "PREDICTIONS":
             items = crawl_predictions_index()
-            # enrichment přes detail pro doplnění chybějících hodnot (pokud máme slug)
-            session = requests.Session(); session.headers.update(HEADERS)
+            # volitelný enrichment z detailu
+            session = requests.Session()
+            session.headers.update(HEADERS)
             improved = 0
-            for idx, it in enumerate(items):
+            for it in items:
                 slug = it.get("slug")
-                if not slug: continue
+                if not slug:
+                    continue
                 html = fetch_prediction_detail(session, slug)
-                if not html: continue
+                if not html:
+                    continue
                 p = parse_prediction_detail(html)
                 changed = False
-                for short, (hdr, _) in HORIZON_MAP.items():
-                    k_price = {"5D":"pred_5d","1M":"pred_1m","3M":"pred_3m","6M":"pred_6m","1Y":"pred_1y"}[short]
-                    k_chg   = {"5D":"chg_5d","1M":"chg_1m","3M":"chg_3m","6M":"chg_6m","1Y":"chg_1y"}[short]
-                    if it.get(k_price) is None and p.get(k_price) is not None:
-                        it[k_price] = p[k_price]; changed = True
-                    if it.get(k_chg) is None and p.get(k_chg) is not None:
-                        it[k_chg] = p[k_chg]; changed = True
-                if it.get("current_price") is None and p.get("current_price") is not None:
-                    it["current_price"] = p["current_price"]; changed = True
-                if changed: improved += 1
-                if DETAIL_SLEEP_MS > 0: time.sleep(DETAIL_SLEEP_MS / 1000.0)
+                def upd(k):
+                    nonlocal changed
+                    if it.get(k) is None and p.get(k) is not None:
+                        it[k] = p[k]
+                        changed = True
+                for k in ["pred_5d","chg_5d","pred_1m","chg_1m","pred_3m","chg_3m","pred_6m","chg_6m","pred_1y","chg_1y","current_price"]:
+                    upd(k)
+                if changed:
+                    improved += 1
+                if DETAIL_SLEEP_MS > 0:
+                    time.sleep(DETAIL_SLEEP_MS / 1000.0)
             dlog("[pred] enrichment improved=%s", improved)
 
-        else:  # HYBRID: zkus index, když málo výsledků, dobij coin-listem
+        else:  # HYBRID
             idx_items = crawl_predictions_index()
             dlog("[hybrid] index_items=%s", len(idx_items))
             items = idx_items
@@ -513,21 +596,22 @@ def main(mytimer: func.TimerRequest) -> None:
                 dlog("[hybrid] coin_list seeds=%s", len(seed))
                 if seed:
                     more = collect_predictions_from_details(seed)
-                    # merge podle symbolu
                     by_sym = {it.get("symbol"): it for it in items if it.get("symbol")}
                     added = 0
                     for it in more:
                         s = it.get("symbol")
                         if s and s not in by_sym:
-                            by_sym[s] = it; added += 1
+                            by_sym[s] = it
+                            added += 1
                     items = list(by_sym.values())
                     dlog("[hybrid] merged add=%s total=%s", added, len(items))
 
-        # dedup dle symbolu (jistota)
-        uniq = {}
+        # dedup dle symbolu
+        uniq: Dict[str, Dict] = {}
         for it in items:
             s = it.get("symbol")
-            if s: uniq[s] = it
+            if s:
+                uniq[s] = it
         items = list(uniq.values())
         dlog("[extract] unique_items=%s", len(items))
 
