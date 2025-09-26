@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
 
 # ===================== Konfigurace =====================
-VERSION = "5.3-static-parsefix2"
+VERSION = "5.4-static-targeted-parsers"
 
 # Azure
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")
@@ -30,7 +30,7 @@ COINLIST_BLOB = os.getenv("COINLIST_BLOB", "CoinList.csv")   # columns: symbol,s
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "45"))
 DETAIL_SLEEP_MS = int(os.getenv("DETAIL_SLEEP_MS", "120"))
 HEADERS = {
-    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/5.3)"),
+    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/5.4)"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -60,18 +60,25 @@ def dlog(msg, *args):
     logging.info(msg, *args)
 
 # ===================== Regexy a helpery =====================
-PRICE_RX = re.compile(r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)")
+PRICE_RX = re.compile(r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?|[0-9]+(?:\.\d+)?)")
 PCT_RX   = re.compile(r"([+\-]?\d+(?:\.\d+)?)\s*%")
-# párový vzor: $cena ... % (max ~120 znaků mezi, bez dalšího $)
-PAIR_RX  = re.compile(r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)(?:(?!\$).){0,120}?([+\-]?\d+(?:\.\d+)?)\s*%", re.S)
+PAIR_RX  = re.compile(
+    r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?|[0-9]+(?:\.\d+)?)(?:(?!\$).){0,160}?([+\-]?\d+(?:\.\d+)?)\s*%",
+    re.S,
+)
 
 SAFE_LABEL_BLOCKS = ("tr","li","div","section","article","p")
 
 def _to_dec(num_str: str) -> Optional[Decimal]:
     try:
-        return Decimal(num_str.replace(",", ""))
+        if num_str is None:
+            return None
+        return Decimal(str(num_str).replace(",", ""))
     except Exception:
         return None
+
+def _text(el) -> str:
+    return el.get_text(" ", strip=True) if el is not None else ""
 
 def parse_price(text: str) -> Optional[Decimal]:
     if not text:
@@ -85,6 +92,16 @@ def parse_pct(text: str) -> Optional[Decimal]:
     m = PCT_RX.search(text)
     return _to_dec(m.group(1)) if m else None
 
+def pct_from_prices(pred: Optional[Decimal], base: Optional[Decimal]) -> Optional[Decimal]:
+    if pred is None or base is None:
+        return None
+    try:
+        if base == 0:
+            return None
+        return (pred - base) * Decimal(100) / base
+    except Exception:
+        return None
+
 def fetch_prediction_detail(session: requests.Session, slug: str) -> Optional[str]:
     url = DETAIL_TMPL.format(slug=slug)
     try:
@@ -96,25 +113,24 @@ def fetch_prediction_detail(session: requests.Session, slug: str) -> Optional[st
         dlog("[detail] error slug=%s: %s", slug, e)
     return None
 
-def _nearest_label_block(node) -> Optional[BeautifulSoup]:
-    """Vezmi nejbližší rodič, který vypadá jako 'řádek/box' s hodnotami."""
+def _nearest_label_block(node):
+    """Najdi nejbližší 'řádek/box' obsahující čísla pro daný label."""
     if not node:
         return None
-    # preferuj <tr>, pak další boxy
+    # preferuj <tr>
     for anc in getattr(node, "parents", []):
         if getattr(anc, "name", "").lower() == "tr":
             return anc
+    # další „boxy“
     for anc in getattr(node, "parents", []):
         if getattr(anc, "name", "").lower() in SAFE_LABEL_BLOCKS:
-            # musí obsahovat $ nebo % (jinak to bude čistě nadpis)
-            t = anc.get_text(" ", strip=True)
+            t = _text(anc)
             if "$" in t or "%" in t:
                 return anc
-    # poslední šance: rodič samotného node
     return node.parent if hasattr(node, "parent") else None
 
-def _find_current_price(soup: BeautifulSoup) -> Optional[Decimal]:
-    """Hledej current price pouze v relevantních blocích a ignoruj předpovědi/roky."""
+def extract_current_price(soup: BeautifulSoup) -> Optional[Decimal]:
+    """Hledej 'Current price' apod., ignoruj bloky s 'prediction/forecast/20xx'."""
     anchors = [
         re.compile(r"\bcurrent\s+price\b", re.I),
         re.compile(r"\blive\s+price\b", re.I),
@@ -122,105 +138,170 @@ def _find_current_price(soup: BeautifulSoup) -> Optional[Decimal]:
         re.compile(r"\bprice\b", re.I),
     ]
     for rx in anchors:
-        for node in soup.find_all(string=rx):
-            block = _nearest_label_block(node)
-            if not block:
+        for n in soup.find_all(string=rx):
+            blk = _nearest_label_block(n)
+            if not blk:
                 continue
-            txt = block.get_text(" ", strip=True)
-            # vyřadíme predikční/roční bloky
-            if re.search(r"prediction|forecast|20\d{2}", txt, re.I):
+            t = _text(blk)
+            if re.search(r"prediction|forecast|20\d{2}", t, re.I):
                 continue
-            price = parse_price(txt)
+            price = parse_price(t)
             if price is not None:
+                dlog("[price] current from %s -> %s", rx.pattern, price)
                 return price
+    # fallback: header „BTC: $ …“
+    hdr = soup.find(string=re.compile(r":\s*\$\s*", re.I))
+    if hdr:
+        t = _text(hdr.parent)
+        price = parse_price(t)
+        if price is not None:
+            dlog("[price] current from header -> %s", price)
+            return price
     return None
 
-def _extract_pair_from_block(block_text: str) -> Tuple[Optional[Decimal], Optional[Decimal], bool]:
-    """Zkus spárovaný vzor '$... ... %' v rámci jednoho bloku."""
-    m = PAIR_RX.search(block_text)
+def price_after_label(soup: BeautifulSoup, label_rx: str) -> Optional[Decimal]:
+    n = soup.find(string=re.compile(label_rx, re.I))
+    if not n:
+        return None
+    blk = _nearest_label_block(n)
+    if not blk:
+        return None
+    t = _text(blk)
+    price = parse_price(t)
+    return price
+
+def extract_pair_from_block_text(txt: str) -> Tuple[Optional[Decimal], Optional[Decimal], bool]:
+    m = PAIR_RX.search(txt)
     if not m:
         return None, None, False
-    price = _to_dec(m.group(1))
-    pct = _to_dec(m.group(2))
-    return price, pct, True
+    return _to_dec(m.group(1)), _to_dec(m.group(2)), True
 
-def _extract_from_block_loose(block_text: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-    """Jemnější fallback: samostatně $ a % uvnitř stejného bloku."""
-    price = parse_price(block_text)
-    pct = parse_pct(block_text)
-    return price, pct
-
-def _find_prediction_pair(soup: BeautifulSoup, label_regex: str) -> Tuple[Optional[Decimal], Optional[Decimal], str]:
+def extract_horizon_pair(soup: BeautifulSoup, label_rx: str, pct_hint_rx: Optional[str] = None) -> Tuple[Optional[Decimal], Optional[Decimal], str]:
     """
-    Najde blok obsahující label (5-Day, 1-Month, …) a vytáhne z něj hodnoty.
-    Nikdy nebere hodnoty mimo tento blok.
+    Najdi blok s daným labelem a vytáhni (price, pct).
+      1) spárovaný vzor '$... ... %' v rámci bloku
+      2) samostatně $ a % v rámci bloku
+      3) pokud pct_hint_rx je zadán, najdi v samostatné větě s tímto hintem %
     """
-    # 1) Přímý nález uzlu s labelem
-    node = soup.find(string=re.compile(label_regex, re.I))
-    if node:
-        block = _nearest_label_block(node)
-        if block:
-            txt = block.get_text(" ", strip=True)
-            price, pct, paired = _extract_pair_from_block(txt)
+    # 1) přímý label
+    n = soup.find(string=re.compile(label_rx, re.I))
+    if n:
+        blk = _nearest_label_block(n)
+        if blk:
+            txt = _text(blk)
+            price, pct, paired = extract_pair_from_block_text(txt)
             if paired:
                 return price, pct, "pair"
-            price, pct = _extract_from_block_loose(txt)
-            if price is not None or pct is not None:
-                return price, pct, "row"
-
-    # 2) Projeď všechny řádky/boxy, které obsahují label (stále uvnitř bloku)
+            price2 = parse_price(txt)
+            pct2 = parse_pct(txt)
+            if price2 is not None or pct2 is not None:
+                return price2, pct2, "block"
+    # 2) scan všech boxů s labelem
     for box in soup.find_all(SAFE_LABEL_BLOCKS):
-        t = box.get_text(" ", strip=True)
-        if not t or not re.search(label_regex, t, re.I):
+        t = _text(box)
+        if not t or not re.search(label_rx, t, re.I):
             continue
-        # ignoruj nesouvisející boxy (bez $/%)
         if "$" not in t and "%" not in t:
             continue
-        price, pct, paired = _extract_pair_from_block(t)
+        price, pct, paired = extract_pair_from_block_text(t)
         if paired:
             return price, pct, "scan-pair"
-        price, pct = _extract_from_block_loose(t)
-        if price is not None or pct is not None:
-            return price, pct, "scan-block"
-
+        price2 = parse_price(t)
+        pct2 = parse_pct(t)
+        if price2 is not None or pct2 is not None:
+            return price2, pct2, "scan-block"
+    # 3) doplňkové procento podle hintu (např. věta „Over the next five days …“)
+    if pct_hint_rx:
+        node = soup.find(string=re.compile(pct_hint_rx, re.I))
+        if node:
+            t = _text(_nearest_label_block(node) or node.parent)
+            pct3 = parse_pct(t)
+            if pct3 is not None:
+                return None, pct3, "hint-pct"
     return None, None, "miss"
+
+def extract_5d_price_and_pct(soup: BeautifulSoup) -> Tuple[Optional[Decimal], Optional[Decimal], str]:
+    # label i běžná varianta bez pomlčky
+    return extract_horizon_pair(
+        soup,
+        r"\b5\s*-\s*Day\s*Prediction\b|\b5\s*Day\s*Prediction\b",
+        pct_hint_rx=r"Over the next five days",
+    )
+
+def extract_1m_price_and_pct(soup: BeautifulSoup) -> Tuple[Optional[Decimal], Optional[Decimal], str]:
+    # 1M: často je % v řádku „Price Prediction  $ …  (x%)“
+    price = price_after_label(soup, r"\b1\s*-\s*Month\s*Prediction\b|\b1\s*Month\s*Prediction\b")
+    pct = None
+    node = soup.find(string=re.compile(r"\bPrice\s+Prediction\b", re.I))
+    if node:
+        t = _text(node.find_parent(["div","section","p"]) or node.parent)
+        pct = parse_pct(t)
+        dbg = "label+priceprediction"
+    else:
+        # fallback na generické hledání v bloku
+        price2, pct2, dbg2 = extract_horizon_pair(soup, r"\b1\s*-\s*Month\s*Prediction\b|\b1\s*Month\s*Prediction\b")
+        price = price or price2
+        pct = pct or pct2
+        dbg = dbg2
+    return price, pct, "1m-" + ("pp" if node else dbg)
+
+def extract_3m_price_and_pct(soup: BeautifulSoup) -> Tuple[Optional[Decimal], Optional[Decimal], str]:
+    return extract_horizon_pair(
+        soup,
+        r"\b3\s*-\s*Month\s*Prediction\b|\b3\s*Month\s*Prediction\b"
+    )
+
+def extract_6m_price_and_pct(soup: BeautifulSoup) -> Tuple[Optional[Decimal], Optional[Decimal], str]:
+    return extract_horizon_pair(
+        soup,
+        r"\b6\s*-\s*Month\s*Prediction\b|\b6\s*Month\s*Prediction\b"
+    )
+
+def extract_1y_price_and_pct(soup: BeautifulSoup) -> Tuple[Optional[Decimal], Optional[Decimal], str]:
+    return extract_horizon_pair(
+        soup,
+        r"\b1\s*-\s*Year\s*Prediction\b|\b1\s*Year\s*Prediction\b"
+    )
 
 def parse_prediction_detail(html: str) -> Dict[str, Optional[Decimal]]:
     """
-    Vytáhne current_price a predikce 5D/1M/3M/6M/1Y z detailu.
-    Striktně bere hodnoty pouze z bloku, kde je zároveň daný label.
+    Cílené parsování: current price + 5D/1M/3M/6M/1Y.
+    Pokud procento pro horizont chybí, dopočítá se z current_price.
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    current_price = _find_current_price(soup)
+    current_price = extract_current_price(soup)
 
-    mapping = [
-        ("5D", r"\b5\s*[-\s]?day\b"),
-        ("1M", r"\b1\s*[-\s]?month\b"),
-        ("3M", r"\b3\s*[-\s]?month\b"),
-        ("6M", r"\b6\s*[-\s]?month\b"),
-        ("1Y", r"\b1\s*[-\s]?year\b"),
-    ]
+    p5, c5, d5 = extract_5d_price_and_pct(soup)
+    dlog("[parse] 5D dbg=%s price=%s pct=%s", d5, p5, c5)
 
-    result: Dict[str, Optional[Decimal]] = {
+    p1m, c1m, d1m = extract_1m_price_and_pct(soup)
+    dlog("[parse] 1M dbg=%s price=%s pct=%s", d1m, p1m, c1m)
+
+    p3m, c3m, d3m = extract_3m_price_and_pct(soup)
+    dlog("[parse] 3M dbg=%s price=%s pct=%s", d3m, p3m, c3m)
+
+    p6m, c6m, d6m = extract_6m_price_and_pct(soup)
+    dlog("[parse] 6M dbg=%s price=%s pct=%s", d6m, p6m, c6m)
+
+    p1y, c1y, d1y = extract_1y_price_and_pct(soup)
+    dlog("[parse] 1Y dbg=%s price=%s pct=%s", d1y, p1y, c1y)
+
+    # dopočty chybějících procent
+    c5  = c5  if c5  is not None else pct_from_prices(p5,  current_price)
+    c1m = c1m if c1m is not None else pct_from_prices(p1m, current_price)
+    c3m = c3m if c3m is not None else pct_from_prices(p3m, current_price)
+    c6m = c6m if c6m is not None else pct_from_prices(p6m, current_price)
+    c1y = c1y if c1y is not None else pct_from_prices(p1y, current_price)
+
+    return {
         "current_price": current_price,
-        "pred_5d": None, "chg_5d": None,
-        "pred_1m": None, "chg_1m": None,
-        "pred_3m": None, "chg_3m": None,
-        "pred_6m": None, "chg_6m": None,
-        "pred_1y": None, "chg_1y": None,
+        "pred_5d": p5,  "chg_5d": c5,
+        "pred_1m": p1m, "chg_1m": c1m,
+        "pred_3m": p3m, "chg_3m": c3m,
+        "pred_6m": p6m, "chg_6m": c6m,
+        "pred_1y": p1y, "chg_1y": c1y,
     }
-
-    for short, rx in mapping:
-        price, pct, dbg = _find_prediction_pair(soup, rx)
-        # Debug – uvidíš, jestli bereme pair/row/scan-block/miss
-        dlog("[parse] horizon=%s dbg=%s price=%s pct=%s", short, dbg, price, pct)
-        if price is not None:
-            result[{"5D":"pred_5d","1M":"pred_1m","3M":"pred_3m","6M":"pred_6m","1Y":"pred_1y"}[short]] = price
-        if pct is not None:
-            result[{"5D":"chg_5d","1M":"chg_1m","3M":"chg_3m","6M":"chg_6m","1Y":"chg_1y"}[short]] = pct
-
-    return result
 
 # ===================== CSV I/O =====================
 def load_csv_rows(container_client, blob_name: str) -> List[Dict]:
@@ -337,7 +418,6 @@ def collect_predictions_static(coinlist: List[Dict]) -> List[Dict]:
         parsed = parse_prediction_detail(html)
         has_any = any(parsed.get(k) is not None for k in ["pred_5d", "pred_1m", "pred_3m", "pred_6m", "pred_1y"])
         if not has_any and parsed.get("current_price") is None:
-            # žádná data z této stránky
             continue
         out.append({
             "symbol": symbol,
@@ -377,7 +457,7 @@ def main(mytimer: func.TimerRequest) -> None:
 
         # --- STATIC režim ---
         if SYMBOL_SOURCE != "STATIC":
-            dlog("[warn] SYMBOL_SOURCE=%s != STATIC -> pokračuji stejně jako STATIC.", SYMBOL_SOURCE)
+            dlog("[warn] SYMBOL_SOURCE=%s != STATIC -> pokračuji jako STATIC.", SYMBOL_SOURCE)
 
         coinlist = load_coinlist_from_blob(cc, COINLIST_BLOB)
         if not coinlist:
@@ -386,7 +466,7 @@ def main(mytimer: func.TimerRequest) -> None:
 
         items = collect_predictions_static(coinlist)
 
-        # dedup dle symbolu (poslední výhra)
+        # dedup dle symbolu
         uniq: Dict[str, Dict] = {}
         for it in items:
             s = it.get("symbol")
