@@ -6,204 +6,255 @@ import time
 import logging
 import traceback
 import datetime as dt
-from decimal import Decimal
 from typing import Dict, List, Optional
 
 import azure.functions as func
 import requests
-from bs4 import BeautifulSoup
-from dateutil.relativedelta import relativedelta
+from bs4 import BeautifulSoup  # jen pro minifikaci (volitelné)
 
 # ===================== Konfigurace =====================
-VERSION = "5.7-static-3horizons"
+VERSION = "6.0-raw-no-parse"
 
+# Azure
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")
 OUTPUT_CONTAINER = os.getenv("OUTPUT_CONTAINER", "models-recalc")
 AZURE_BLOB_NAME = os.getenv("AZURE_BLOB_NAME", "CoinDeskModels.csv")
 
-SYMBOL_SOURCE = os.getenv("SYMBOL_SOURCE", "STATIC").upper()
-COINLIST_BLOB = os.getenv("COINLIST_BLOB", "CoinList.csv")
+# Vstupní seznam tokenů z blobu
+COINLIST_BLOB = os.getenv("COINLIST_BLOB", "CoinList.csv")   # sloupce: symbol,slug,token_name
 
+# HTTP
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "45"))
 DETAIL_SLEEP_MS = int(os.getenv("DETAIL_SLEEP_MS", "120"))
 HEADERS = {
-    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/5.7)"),
+    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/6.0)"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
 DETAIL_TMPL = "https://coincodex.com/crypto/{slug}/price-prediction/"
 
-# Pouze 5D,1M,3M
-HORIZON_MAP = {
-    "5D": ("5D Prediction", lambda d: d + relativedelta(days=5)),
-    "1M": ("1M Prediction", lambda d: d + relativedelta(months=1)),
-    "3M": ("3M Prediction", lambda d: d + relativedelta(months=3)),
-}
+# Limit syrového HTML v CSV (aby soubor nebyl obří)
+MAX_RAW_LEN = int(os.getenv("MAX_RAW_LEN", "20000"))
 
+# CSV schema (raw výstup)
 CSV_FIELDS = [
-    "scrape_date", "load_ts", "symbol", "token_name", "current_price",
-    "horizon", "model_to", "predicted_price", "predicted_change_pct",
+    "scrape_date", "load_ts",
+    "symbol", "token_name", "slug", "source_url",
+    "raw_html_minified", "raw_truncated",
     "is_active", "validation"
 ]
 
-# ===================== Log =====================
-def dlog(msg, *args): logging.info(msg, *args)
+# ===================== Log util =====================
+def dlog(msg, *args):
+    logging.info(msg, *args)
 
-# ===================== Parser =====================
-PRICE_RX = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)")
-PCT_RX   = re.compile(r"([+\-]?\d+(?:\.\d+)?)\s*%")
-
-def parse_price_and_change(text: str):
-    if not text: return None, None
-    price, pct = None, None
-    mp = PRICE_RX.search(text)
-    if mp:
-        price = Decimal(mp.group(1).replace(",", ""))
-    mpct = PCT_RX.search(text)
-    if mpct:
-        pct = Decimal(mpct.group(1))
-    return price, pct
-
-def fetch_prediction_detail(session, slug: str) -> Optional[str]:
-    try:
-        r = session.get(DETAIL_TMPL.format(slug=slug), headers=HEADERS, timeout=HTTP_TIMEOUT)
-        if r.status_code == 200:
-            return r.text
-    except Exception as e:
-        dlog("[detail] error %s: %s", slug, e)
-    return None
-
-def parse_prediction_detail(html: str) -> Dict[str, Optional[Decimal]]:
-    soup = BeautifulSoup(html, "html.parser")
-    result = {"current_price": None,
-              "pred_5d": None,"chg_5d": None,
-              "pred_1m": None,"chg_1m": None,
-              "pred_3m": None,"chg_3m": None}
-
-    # current price
-    cur = soup.find(string=re.compile(r"Current Price", re.I))
-    if cur:
-        t = cur.find_parent().get_text(" ", strip=True)
-        p,_ = parse_price_and_change(t)
-        result["current_price"] = p
-
-    # horizons
-    mapping = {
-        "5D": r"\b5[- ]?Day\b|\b5D\b",
-        "1M": r"\b1[- ]?Month\b|\b1M\b",
-        "3M": r"\b3[- ]?Month\b|\b3M\b",
-    }
-    for h, rx in mapping.items():
-        node = soup.find(string=re.compile(rx, re.I))
-        if node:
-            t = node.find_parent().get_text(" ", strip=True)
-            p,c = parse_price_and_change(t)
-            result[f"pred_{h.lower()}"] = p
-            result[f"chg_{h.lower()}"] = c
-    return result
-
-# ===================== CSV I/O =====================
-def load_csv_rows(cc, blob_name):
+# ===================== Blob CSV I/O =====================
+def load_csv_rows(container_client, blob_name: str) -> List[Dict]:
     from azure.core.exceptions import ResourceNotFoundError
-    bc = cc.get_blob_client(blob_name)
+    blob_client = container_client.get_blob_client(blob_name)
     try:
-        data = bc.download_blob().readall().decode("utf-8")
+        content = blob_client.download_blob().readall().decode("utf-8", errors="ignore")
     except ResourceNotFoundError:
         return []
-    rows=[]
-    with io.StringIO(data) as f:
+    except Exception as e:
+        logging.warning("[csv-read] Failed to read existing blob: %s", e)
+        return []
+
+    rows: List[Dict] = []
+    with io.StringIO(content) as f:
         reader = csv.DictReader(f)
         for r in reader:
-            rows.append({k:r.get(k,"") for k in CSV_FIELDS})
+            # zarovnej klíče k aktuálnímu schématu
+            row = {k: r.get(k, "") for k in CSV_FIELDS}
+            rows.append(row)
+    dlog("[csv-read] loaded rows=%s", len(rows))
     return rows
 
-def write_csv_rows(cc, blob_name, rows):
-    bc = cc.get_blob_client(blob_name)
+def write_csv_rows(container_client, blob_name: str, rows: List[Dict]) -> None:
+    blob_client = container_client.get_blob_client(blob_name)
     buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=CSV_FIELDS, lineterminator="\n")
-    w.writeheader()
+    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS, lineterminator="\n", extrasaction="ignore", quoting=csv.QUOTE_MINIMAL)
+    writer.writeheader()
     for r in rows:
-        w.writerow(r)
-    bc.upload_blob(buf.getvalue().encode("utf-8"), overwrite=True)
+        for k in CSV_FIELDS:
+            r.setdefault(k, "")
+        writer.writerow(r)
+    data = buf.getvalue().encode("utf-8")
+    blob_client.upload_blob(data, overwrite=True)
+    dlog("[csv-write] uploaded rows=%s size=%s", len(rows), len(data))
 
-# ===================== Rows =====================
-def build_active_rows(scrape_date, load_ts, items):
-    rows=[]
-    for it in items:
-        for short in ["5D","1M","3M"]:
-            p = it.get(f"pred_{short.lower()}")
-            c = it.get(f"chg_{short.lower()}")
-            if p is None: continue
-            _,to_fn = HORIZON_MAP[short]
-            rows.append({
-                "scrape_date": scrape_date.isoformat(),
-                "load_ts": load_ts,
-                "symbol": it["symbol"],
-                "token_name": it["token_name"],
-                "current_price": "" if it.get("current_price") is None else str(it["current_price"]),
-                "horizon": short,
-                "model_to": to_fn(scrape_date).isoformat(),
-                "predicted_price": str(p),
-                "predicted_change_pct": "" if c is None else str(c),
-                "is_active": "True",
-                "validation": ""
-            })
-    return rows
-
-def deactivate_todays_rows(existing, today):
-    ch=0
+def deactivate_todays_rows(existing: List[Dict], today_iso: str) -> int:
+    changed = 0
     for r in existing:
-        if r["scrape_date"]==today and r["is_active"]=="True":
-            r["is_active"]="False"; ch+=1
-    return ch
+        if r.get("scrape_date") == today_iso and str(r.get("is_active")).strip().lower() == "true":
+            r["is_active"] = "False"
+            changed += 1
+    return changed
 
 # ===================== CoinList =====================
-def load_coinlist_from_blob(cc, blob_name):
-    bc=cc.get_blob_client(blob_name)
-    content=bc.download_blob().readall().decode("utf-8")
-    out=[]
+def load_coinlist_from_blob(container_client, blob_name: str) -> List[Dict]:
+    """Načte CoinList.csv (symbol,slug,token_name) z OUTPUT_CONTAINER."""
+    blob_client = container_client.get_blob_client(blob_name)
+    content = blob_client.download_blob().readall().decode("utf-8", errors="ignore")
+    out: List[Dict] = []
     with io.StringIO(content) as f:
-        reader=csv.DictReader(f)
+        reader = csv.DictReader(f)
+        cols = [c.strip().lower() for c in (reader.fieldnames or [])]
+        required = {"symbol", "slug", "token_name"}
+        if not required.issubset(set(cols)):
+            raise ValueError(f"CoinList.csv must have columns: symbol, slug, token_name (got: {cols})")
         for row in reader:
-            out.append({"symbol":row["symbol"].upper(),
-                        "slug":row["slug"].lower(),
-                        "token_name":row["token_name"]})
+            sym = (row.get("symbol") or "").strip().upper()
+            slug = (row.get("slug") or "").strip().lower()
+            name = (row.get("token_name") or "").strip()
+            if not sym or not slug:
+                continue
+            out.append({"symbol": sym, "slug": slug, "token_name": name})
+    dlog("[coinlist] loaded items=%s", len(out))
     return out
 
-def collect_predictions_static(coinlist):
-    s=requests.Session(); s.headers.update(HEADERS)
-    out=[]
+# ===================== HTTP: fetch detail (bez parsování) =====================
+def fetch_prediction_detail(session: requests.Session, slug: str) -> Optional[str]:
+    url = DETAIL_TMPL.format(slug=slug)
+    try:
+        resp = session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT)
+        dlog("[detail] slug=%s status=%s len=%s", slug, resp.status_code, len(resp.text))
+        if resp.status_code == 200:
+            return resp.text
+    except Exception as e:
+        dlog("[detail] error slug=%s: %s", slug, e)
+    return None
+
+# ===================== Minifikace HTML (jen zmenšení, bez parsování hodnot) =====================
+WS_RX = re.compile(r"\s+")
+
+def minify_html(html: str) -> str:
+    """
+    Lehce zmenší HTML: odmaže přebytečné whitespace a nové řádky,
+    ale nechá obsah beze změny (žádné parsování hodnot).
+    """
+    if not html:
+        return ""
+    # Volitelně můžeme odstranit <script> a <style>, aby CSV nebyl přerostlý:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        text = str(soup)
+    except Exception:
+        # fallback: bez BeautifulSoup
+        text = html
+    # kolaps whitespace
+    text = WS_RX.sub(" ", text)
+    return text.strip()
+
+# ===================== Sběr RAW dat =====================
+def collect_raw_pages(coinlist: List[Dict]) -> List[Dict]:
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    out: List[Dict] = []
     for coin in coinlist:
-        html=fetch_prediction_detail(s, coin["slug"])
-        if not html: continue
-        parsed=parse_prediction_detail(html)
-        if not any(parsed.values()): continue
-        out.append({"symbol":coin["symbol"],
-                    "token_name":coin["token_name"],
-                    **parsed})
-        if DETAIL_SLEEP_MS>0: time.sleep(DETAIL_SLEEP_MS/1000.0)
+        slug = coin["slug"]
+        symbol = coin["symbol"]
+        token_name = coin.get("token_name", "")
+        url = DETAIL_TMPL.format(slug=slug)
+
+        html = fetch_prediction_detail(session, slug)
+        if not html:
+            continue
+
+        mini = minify_html(html)
+        truncated = "False"
+        if len(mini) > MAX_RAW_LEN:
+            mini = mini[:MAX_RAW_LEN]
+            truncated = "True"
+
+        out.append({
+            "symbol": symbol,
+            "token_name": token_name,
+            "slug": slug,
+            "source_url": url,
+            "raw_html_minified": mini,
+            "raw_truncated": truncated,
+        })
+
+        if DETAIL_SLEEP_MS > 0:
+            time.sleep(DETAIL_SLEEP_MS / 1000.0)
+
+    dlog("[raw] collected_items=%s (from slugs=%s)", len(out), len(coinlist))
     return out
 
 # ===================== MAIN =====================
 def main(mytimer: func.TimerRequest) -> None:
-    scrape_date=dt.date.today()
-    load_ts=dt.datetime.now(dt.timezone.utc).isoformat()
-    dlog("[start] version=%s", VERSION)
+    scrape_date = dt.date.today()
+    load_ts = dt.datetime.now(dt.timezone.utc).isoformat()
+    dlog("[start] version=%s OUTPUT_CONTAINER=%s AZURE_BLOB_NAME=%s COINLIST_BLOB=%s MAX_RAW_LEN=%s",
+         VERSION, OUTPUT_CONTAINER, AZURE_BLOB_NAME, COINLIST_BLOB, MAX_RAW_LEN)
 
-    from azure.storage.blob import BlobServiceClient
-    bsc=BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
-    cc=bsc.get_container_client(OUTPUT_CONTAINER)
-    try: cc.create_container()
-    except: pass
+    if not STORAGE_CONNECTION_STRING:
+        logging.error("[env] AzureWebJobsStorage is NOT set. Exiting.")
+        return
 
-    coinlist=load_coinlist_from_blob(cc, COINLIST_BLOB)
-    items=collect_predictions_static(coinlist)
+    try:
+        from azure.storage.blob import BlobServiceClient
+        bsc = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+        cc = bsc.get_container_client(OUTPUT_CONTAINER)
+        try:
+            cc.create_container()
+            dlog("[blob] container created: %s", OUTPUT_CONTAINER)
+        except Exception:
+            dlog("[blob] container exists: %s", OUTPUT_CONTAINER)
 
-    uniq={it["symbol"]:it for it in items}
-    items=list(uniq.values())
+        # 1) načti coin list
+        coinlist = load_coinlist_from_blob(cc, COINLIST_BLOB)
+        if not coinlist:
+            dlog("[coinlist] empty -> stop")
+            return
 
-    existing=load_csv_rows(cc, AZURE_BLOB_NAME)
-    deact=deactivate_todays_rows(existing, scrape_date.isoformat())
-    new=build_active_rows(scrape_date, load_ts, items)
-    all_rows=existing+new
-    dlog("[csv] deactivated=%s newly_active=%s total=%s", deact, len(new), len(all_rows))
-    write_csv_rows(cc, AZURE_BLOB_NAME, all_rows)
+        # 2) stáhni RAW stránky
+        items = collect_raw_pages(coinlist)
+
+        # 3) dedup dle symbolu (poslední výhra, pro jistotu)
+        uniq: Dict[str, Dict] = {}
+        for it in items:
+            s = it.get("symbol")
+            if s:
+                uniq[s] = it
+        items = list(uniq.values())
+        dlog("[raw] unique_items=%s", len(items))
+
+        # 4) načti existující CSV a zneaktivni dnešní řádky
+        existing = load_csv_rows(cc, AZURE_BLOB_NAME)
+        deact = deactivate_todays_rows(existing, scrape_date.isoformat())
+
+        # 5) postav nové aktivní řádky (RAW)
+        new_rows: List[Dict] = []
+        for it in items:
+            new_rows.append({
+                "scrape_date": scrape_date.isoformat(),
+                "load_ts": load_ts,
+                "symbol": it["symbol"],
+                "token_name": it.get("token_name", ""),
+                "slug": it.get("slug", ""),
+                "source_url": it.get("source_url", ""),
+                "raw_html_minified": it.get("raw_html_minified", ""),
+                "raw_truncated": it.get("raw_truncated", "False"),
+                "is_active": "True",
+                "validation": ""
+            })
+
+        all_rows = existing + new_rows
+        dlog("[csv] deactivated_today=%s newly_active=%s final_rows=%s", deact, len(new_rows), len(all_rows))
+
+        # 6) zapiš CSV (overwrite)
+        write_csv_rows(cc, AZURE_BLOB_NAME, all_rows)
+        dlog("[done] Overwrite completed.")
+
+    except Exception as e:
+        logging.error("[fatal] Unhandled exception: %s", e)
+        logging.error(traceback.format_exc())
+        return
