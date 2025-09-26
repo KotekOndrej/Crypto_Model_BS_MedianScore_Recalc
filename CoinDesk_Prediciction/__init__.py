@@ -171,16 +171,16 @@ def fetch_prediction_detail(session: requests.Session, slug: str) -> Optional[st
         dlog("[detail] error slug=%s: %s", slug, e)
     return None
 
+_SYMBOL_NAME_RX = re.compile(r"^\s*([A-Z0-9]{2,10})\s+(.+)$")
+_TITLE_RX = re.compile(r"^\s*([A-Z0-9]{2,10})\s+(.+?)\s+Price Prediction", re.I)
+
 def parse_prediction_detail(html: str) -> Dict[str, Optional[Decimal]]:
-    """
-    Z detailu predikce vytáhne: (symbol, token_name), current_price a predikce 5D/1M/3M/6M/1Y + %.
-    - symbol/token_name: z hlavního nadpisu (např. "ETH Ethereum"), případně z prvku se symbolem.
-    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # symbol / token_name z hlavičky (fallbacky)
+    # --- SYMBOL & NAME ---
     symbol, token_name = None, None
-    # h1/h2 s textem "ETH Ethereum"
+
+    # 1) H1/H2 „ETH Ethereum …“
     h = soup.find(["h1","h2"])
     if h:
         t = h.get_text(" ", strip=True)
@@ -188,7 +188,14 @@ def parse_prediction_detail(html: str) -> Dict[str, Optional[Decimal]]:
         if m:
             symbol, token_name = m.group(1), m.group(2)
 
-    # další fallback: badge se symbolem (např. <span class="cc-symbol">ETH</span>)
+    # 2) <title> „ETH Ethereum Price Prediction …“
+    if not symbol:
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        m = _TITLE_RX.match(title)
+        if m:
+            symbol, token_name = m.group(1), m.group(2)
+
+    # 3) badge/prvky se symbolem (cc-symbol|ticker|symbol)
     if not symbol:
         badge = soup.find(class_=re.compile(r"(cc-symbol|ticker|symbol)", re.I))
         if badge:
@@ -196,13 +203,81 @@ def parse_prediction_detail(html: str) -> Dict[str, Optional[Decimal]]:
             if 2 <= len(sym) <= 10:
                 symbol = sym
 
-    # current price (volitelné)
+    # 4) poslední záchrana: symbol = první slovo z title, pokud vypadá jako ticker
+    if not symbol and title:
+        first = title.split()[0].upper()
+        if 2 <= len(first) <= 10 and first.isalnum():
+            symbol = first
+
+    # --- CURRENT PRICE (nevadí, když chybí) ---
     current_price = None
-    price_candidate = soup.find(string=re.compile(r"Price", re.I))
+    # zkuste „Price“ v hlavičce sekce
+    price_candidate = soup.find(string=re.compile(r"\bPrice\b", re.I))
     if price_candidate:
         section = price_candidate.parent.get_text(" ", strip=True) if hasattr(price_candidate, "parent") else str(price_candidate)
         cp, _ = parse_price_and_change(section)
         current_price = cp or current_price
+
+    # --- PREDIKCE ---
+    def find_row(label_regex: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        # „5-Day“, „1-Month“, …; někdy to bývá ve <tr> s <th> textem
+        node = soup.find(string=re.compile(label_regex, re.I))
+        if not node:
+            # zkus <th> s přesným textem
+            th = soup.find("th", string=re.compile(label_regex, re.I))
+            node = th if th else None
+        if not node:
+            return None, None
+        container = node.parent if hasattr(node, "parent") else None
+        text = container.get_text(" ", strip=True) if container else str(node)
+        return parse_price_and_change(text)
+
+    mapping = [
+        ("5D", "5[-\\s]?Day"),
+        ("1M", "1[-\\s]?Month"),
+        ("3M", "3[-\\s]?Month"),
+        ("6M", "6[-\\s]?Month"),
+        ("1Y", "1[-\\s]?Year"),
+    ]
+
+    result: Dict[str, Optional[Decimal]] = {
+        "symbol": symbol,
+        "token_name": token_name or "",
+        "current_price": current_price,
+        "pred_5d": None, "chg_5d": None,
+        "pred_1m": None, "chg_1m": None,
+        "pred_3m": None, "chg_3m": None,
+        "pred_6m": None, "chg_6m": None,
+        "pred_1y": None, "chg_1y": None,
+    }
+
+    label_to_key = {
+        "5D": ("pred_5d", "chg_5d"),
+        "1M": ("pred_1m", "chg_1m"),
+        "3M": ("pred_3m", "chg_3m"),
+        "6M": ("pred_6m", "chg_6m"),
+        "1Y": ("pred_1y", "chg_1y"),
+    }
+
+    for short, rx in mapping:
+        price, pct = find_row(rx)
+        k_price, k_chg = label_to_key[short]
+        if price is not None:
+            result[k_price] = price
+        if pct is not None:
+            result[k_chg] = pct
+
+    # Akceptuj i případy bez token_name
+    if result["symbol"]:
+        return result
+    else:
+        # bez symbolu řádek nebudeme používat
+        return {
+            "symbol": None, "token_name": "", "current_price": None,
+            "pred_5d": None, "chg_5d": None, "pred_1m": None, "chg_1m": None,
+            "pred_3m": None, "chg_3m": None, "pred_6m": None, "chg_6m": None,
+            "pred_1y": None, "chg_1y": None,
+        }
 
     def find_row(label_regex: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
         row = soup.find(string=re.compile(label_regex, re.I))
