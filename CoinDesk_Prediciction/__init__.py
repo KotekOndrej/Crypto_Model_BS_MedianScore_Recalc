@@ -2,7 +2,6 @@ import os
 import io
 import re
 import csv
-import json
 import time
 import logging
 import traceback
@@ -17,7 +16,7 @@ from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
 
 # ===================== Konfigurace =====================
-VERSION = "10.0-slug+ranges+table+paragraph"
+VERSION = "10.1-nohtml-log"
 
 # Azure
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # povinné
@@ -31,7 +30,7 @@ COINLIST_BLOB = os.getenv("COINLIST_BLOB", "CoinList.csv")
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "45"))
 DETAIL_SLEEP_MS = int(os.getenv("DETAIL_SLEEP_MS", "120"))
 HEADERS = {
-    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/10.0)"),
+    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/10.1)"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -40,14 +39,14 @@ HEADERS = {
 
 DETAIL_TMPL = "https://coincodex.com/crypto/{slug}/price-prediction/"
 
-# CSV schema
+# CSV schema (bez HTML dumpů / cest)
 CSV_FIELDS = [
     "scrape_date", "load_ts",
     "symbol", "slug", "token_name",
     "current_price",
     "horizon", "model_to",
     "predicted_price", "predicted_change_pct",
-    "page_url", "html_len", "html_blob",
+    "page_url", "html_len",
     "is_active", "validation",
 ]
 
@@ -114,34 +113,18 @@ def txt(el) -> str:
     return normalize_text(el.get_text(" ", strip=True)) if el is not None else ""
 
 # ===================== HTTP =====================
-def fetch_prediction_detail(session: requests.Session, slug: str) -> Optional[str]:
+def fetch_prediction_detail(session: requests.Session, slug: str) -> Tuple[Optional[str], int]:
     url = DETAIL_TMPL.format(slug=slug)
     try:
         resp = session.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT)
-        # zkus explicitně UTF-8
         resp.encoding = "utf-8"
         html = resp.text
         dlog("[detail] slug=%s status=%s len=%s", slug, resp.status_code, len(html))
         if resp.status_code == 200:
-            return html
+            return html, len(html)
     except Exception as e:
         dlog("[detail] error slug=%s: %s", slug, e)
-    return None
-
-# ===================== Upload full HTML =====================
-def upload_full_html(container_client, slug: str, scrape_date: dt.date, load_ts: str, html: str) -> str:
-    """
-    Uloží celé HTML do blobu: html/{slug}/{YYYY-MM-DD}/{HHMMSS}.html
-    Vrací blob path (bez SAS).
-    """
-    safe_slug = re.sub(r"[^a-z0-9\-]", "-", slug.lower())
-    ts = load_ts.replace(":", "").replace("-", "")
-    hhmmss = ts.split("T")[1].split(".")[0] if "T" in ts else ts[-6:]
-    blob_path = f"html/{safe_slug}/{scrape_date.isoformat()}/{hhmmss}.html"
-    bc = container_client.get_blob_client(blob_path)
-    bc.upload_blob(html.encode("utf-8"), overwrite=True)
-    dlog("[html] saved -> %s", blob_path)
-    return blob_path
+    return None, 0
 
 # ===================== Parsování: Current Price + tabulkový predicted =====================
 def parse_table_prices(soup: BeautifulSoup) -> Dict[str, Optional[Decimal]]:
@@ -166,7 +149,6 @@ def parse_table_prices(soup: BeautifulSoup) -> Dict[str, Optional[Decimal]]:
     return out
 
 # ===================== Parsování: prediction ranges (5D/1M/3M) =====================
-# Labely v UI: "5-Day Prediction", "1-Month Prediction", "3-Month Prediction"
 def parse_prediction_ranges(soup: BeautifulSoup) -> Dict[str, Optional[Decimal]]:
     """
     Hledá bloky: div.prediction-ranges .prediction-range
@@ -179,8 +161,7 @@ def parse_prediction_ranges(soup: BeautifulSoup) -> Dict[str, Optional[Decimal]]
 
     for rg in ranges:
         t = txt(rg)
-        # Pokus vytáhnout cenu zevnitř, když je struktura hlubší:
-        # preferuj poslední <div> s $ … jinak padni na celý text.
+        # zkus najít vnitřní <div> s cenou, jinak spadni na celý text
         price_text = ""
         price_divs = [d for d in rg.find_all("div") if d and "$" in d.get_text()]
         if price_divs:
@@ -189,7 +170,6 @@ def parse_prediction_ranges(soup: BeautifulSoup) -> Dict[str, Optional[Decimal]]
             price_text = t
 
         p = clean_money_from_text(price_text)
-
         lt = t.lower()
         if lt.startswith("5-day") or "5-day prediction" in lt:
             out["5D"] = p or out["5D"]
@@ -201,7 +181,6 @@ def parse_prediction_ranges(soup: BeautifulSoup) -> Dict[str, Optional[Decimal]]
     return out
 
 # ===================== Parsování: 5D fallback z odstavce =====================
-# "Over the next five days, Bitcoin will reach the highest price of $ 122,373 ... which would represent 11.87% ..."
 _RX_5D_SENTENCE = re.compile(
     r"over the next five days.*?\$[\s\u202F]*([\d,]+).*?represent\s*([+\-]?\d+(?:\.\d+)?)\s*%",
     re.I | re.S
@@ -274,7 +253,7 @@ def load_coinlist_from_blob(container_client, blob_name: str) -> List[Dict]:
     return out
 
 # ===================== Sběr dat přes slug detail =====================
-def collect_predictions_by_slug(coinlist: List[Dict], container_client, scrape_date: dt.date, load_ts: str) -> List[Dict]:
+def collect_predictions_by_slug(coinlist: List[Dict], scrape_date: dt.date, load_ts: str) -> List[Dict]:
     session = requests.Session()
     session.headers.update(HEADERS)
 
@@ -285,12 +264,9 @@ def collect_predictions_by_slug(coinlist: List[Dict], container_client, scrape_d
         token_name = coin.get("token_name", "")
         url = DETAIL_TMPL.format(slug=slug)
 
-        html = fetch_prediction_detail(session, slug)
+        html, html_len = fetch_prediction_detail(session, slug)
         if not html:
             continue
-
-        # uložit celé HTML
-        blob_path = upload_full_html(container_client, slug, scrape_date, load_ts, html)
 
         # soup (HTML parser)
         soup = BeautifulSoup(html, "html.parser")
@@ -319,8 +295,7 @@ def collect_predictions_by_slug(coinlist: List[Dict], container_client, scrape_d
             "slug": slug,
             "token_name": token_name,
             "page_url": url,
-            "html_len": len(html),
-            "html_blob": blob_path,
+            "html_len": html_len,
             "current_price": current_price,
             "pred_5d": pred_5d,
             "pred_1m": pred_1m if pred_1m is not None else table_pred,  # fallback 1M z tabulky
@@ -338,7 +313,7 @@ def collect_predictions_by_slug(coinlist: List[Dict], container_client, scrape_d
 # ===================== Build rows (jen 5D/1M/3M) =====================
 def build_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[Dict]:
     rows: List[Dict] = []
-    def mkrow(symbol, slug, name, current_price, horizon, model_to, pred_price, pred_pct, page_url, html_len, html_blob):
+    def mkrow(symbol, slug, name, current_price, horizon, model_to, pred_price, pred_pct, page_url, html_len):
         return {
             "scrape_date": scrape_date.isoformat(),
             "load_ts": load_ts,
@@ -352,7 +327,6 @@ def build_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[Di
             "predicted_change_pct": "" if pred_pct is None else str(pred_pct),
             "page_url": page_url,
             "html_len": str(html_len),
-            "html_blob": html_blob,
             "is_active": "True",
             "validation": ""
         }
@@ -363,10 +337,8 @@ def build_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[Di
         name = it.get("token_name", "")
         url  = it.get("page_url", "")
         hlen = it.get("html_len", 0)
-        hkey = it.get("html_blob", "")
 
         curr = to_decimal(it.get("current_price"))
-        # páry (horizon -> months)
         horizons = [
             ("5D", lambda d: d + relativedelta(days=5), it.get("pred_5d"), it.get("chg_5d_hint")),
             ("1M", lambda d: d + relativedelta(months=1), it.get("pred_1m"), None),
@@ -379,7 +351,7 @@ def build_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[Di
                 continue
             pct = to_decimal(chg) if chg is not None else pct_from_prices(pred_dec, curr)
             model_to = fn_to(scrape_date).isoformat()
-            rows.append(mkrow(sym, slug, name, curr, short, model_to, pred_dec, pct, url, hlen, hkey))
+            rows.append(mkrow(sym, slug, name, curr, short, model_to, pred_dec, pct, url, hlen))
 
     return rows
 
@@ -410,8 +382,8 @@ def main(mytimer: func.TimerRequest) -> None:
             dlog("[coinlist] empty -> stop")
             return
 
-        # 2) stáhni a ulož detail + full HTML
-        items = collect_predictions_by_slug(coinlist, cc, scrape_date, load_ts)
+        # 2) stáhni detaily (bez ukládání HTML)
+        items = collect_predictions_by_slug(coinlist, scrape_date, load_ts)
 
         # 3) sestav řádky (5D,1M,3M když jsou k dispozici)
         new_rows = build_rows(scrape_date, load_ts, items)
