@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
 
 # ===================== Konfigurace =====================
-VERSION = "10.1-nohtml-log"
+VERSION = "10.2-nohtml-log+deactivate-today"
 
 # Azure
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")  # povinné
@@ -30,7 +30,7 @@ COINLIST_BLOB = os.getenv("COINLIST_BLOB", "CoinList.csv")
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "45"))
 DETAIL_SLEEP_MS = int(os.getenv("DETAIL_SLEEP_MS", "120"))
 HEADERS = {
-    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/10.1)"),
+    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/10.2)"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -39,7 +39,7 @@ HEADERS = {
 
 DETAIL_TMPL = "https://coincodex.com/crypto/{slug}/price-prediction/"
 
-# CSV schema (bez HTML dumpů / cest)
+# CSV schema
 CSV_FIELDS = [
     "scrape_date", "load_ts",
     "symbol", "slug", "token_name",
@@ -49,8 +49,6 @@ CSV_FIELDS = [
     "page_url", "html_len",
     "is_active", "validation",
 ]
-
-SAFE_BLOCKS = ("div","section","article","li","tr","td","p")
 
 # ===================== Log util =====================
 def dlog(msg, *args):
@@ -128,47 +126,29 @@ def fetch_prediction_detail(session: requests.Session, slug: str) -> Tuple[Optio
 
 # ===================== Parsování: Current Price + tabulkový predicted =====================
 def parse_table_prices(soup: BeautifulSoup) -> Dict[str, Optional[Decimal]]:
-    """
-    Z tabulky table.table-grid.prediction-data-table vytáhne:
-      - current_price (tr.data-current-price > td)
-      - table_predicted_price (tr.data-predicted-price > td) – často odpovídá 1M
-    """
     out = {"current_price": None, "table_predicted_price": None}
     tbl = soup.select_one("table.table-grid.prediction-data-table")
     if not tbl:
         return out
-
     curr_td = tbl.select_one("tr.data-current-price > td")
     pred_td = tbl.select_one("tr.data-predicted-price > td")
-
     if curr_td:
         out["current_price"] = clean_money_from_text(txt(curr_td))
     if pred_td:
         out["table_predicted_price"] = clean_money_from_text(txt(pred_td))
-
     return out
 
 # ===================== Parsování: prediction ranges (5D/1M/3M) =====================
 def parse_prediction_ranges(soup: BeautifulSoup) -> Dict[str, Optional[Decimal]]:
-    """
-    Hledá bloky: div.prediction-ranges .prediction-range
-    Každý range má label (5-Day / 1-Month / 3-Month) a vedle toho $ cena.
-    """
     out = {"5D": None, "1M": None, "3M": None}
     ranges = soup.select("div.prediction-ranges .prediction-range")
     if not ranges:
         return out
-
     for rg in ranges:
         t = txt(rg)
-        # zkus najít vnitřní <div> s cenou, jinak spadni na celý text
         price_text = ""
         price_divs = [d for d in rg.find_all("div") if d and "$" in d.get_text()]
-        if price_divs:
-            price_text = txt(price_divs[-1])
-        else:
-            price_text = t
-
+        price_text = txt(price_divs[-1]) if price_divs else t
         p = clean_money_from_text(price_text)
         lt = t.lower()
         if lt.startswith("5-day") or "5-day prediction" in lt:
@@ -177,7 +157,6 @@ def parse_prediction_ranges(soup: BeautifulSoup) -> Dict[str, Optional[Decimal]]
             out["1M"] = p or out["1M"]
         elif lt.startswith("3-month") or "3-month prediction" in lt or "3 month prediction" in lt:
             out["3M"] = p or out["3M"]
-
     return out
 
 # ===================== Parsování: 5D fallback z odstavce =====================
@@ -207,7 +186,6 @@ def load_csv_rows(container_client, blob_name: str) -> List[Dict]:
     except Exception as e:
         logging.warning("[csv-read] Failed to read existing blob: %s", e)
         return []
-
     rows: List[Dict] = []
     with io.StringIO(content) as f:
         reader = csv.DictReader(f)
@@ -256,7 +234,6 @@ def load_coinlist_from_blob(container_client, blob_name: str) -> List[Dict]:
 def collect_predictions_by_slug(coinlist: List[Dict], scrape_date: dt.date, load_ts: str) -> List[Dict]:
     session = requests.Session()
     session.headers.update(HEADERS)
-
     out: List[Dict] = []
     for coin in coinlist:
         slug = coin["slug"]
@@ -268,7 +245,6 @@ def collect_predictions_by_slug(coinlist: List[Dict], scrape_date: dt.date, load
         if not html:
             continue
 
-        # soup (HTML parser)
         soup = BeautifulSoup(html, "html.parser")
 
         # 1) tabulka: current + table predicted
@@ -355,6 +331,20 @@ def build_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[Di
 
     return rows
 
+# ===================== Deaktivace dřívějších záznamů pro dnešní den =====================
+def deactivate_today_for_symbols(existing_rows: List[Dict], today_iso: str, symbols_to_deactivate: set) -> int:
+    """
+    Nastaví is_active=False pro všechny řádky z dnešního dne (scrape_date==today_iso),
+    které patří do množiny daných symbolů. Vrací počet změněných řádků.
+    """
+    changed = 0
+    for r in existing_rows:
+        if r.get("scrape_date") == today_iso and r.get("symbol") in symbols_to_deactivate:
+            if str(r.get("is_active", "")).strip().lower() == "true":
+                r["is_active"] = "False"
+                changed += 1
+    return changed
+
 # ===================== MAIN =====================
 def main(mytimer: func.TimerRequest) -> None:
     scrape_date = dt.date.today()
@@ -385,11 +375,17 @@ def main(mytimer: func.TimerRequest) -> None:
         # 2) stáhni detaily (bez ukládání HTML)
         items = collect_predictions_by_slug(coinlist, scrape_date, load_ts)
 
-        # 3) sestav řádky (5D,1M,3M když jsou k dispozici)
+        # 3) sestav nové řádky (5D,1M,3M když jsou k dispozici)
         new_rows = build_rows(scrape_date, load_ts, items)
 
-        # 4) načti dosavadní CSV a připiš nové řádky (bez deaktivace – chceme historii)
+        # 4) načti dosavadní CSV a znevalidni dnešní záznamy pro dotčené symboly
         existing = load_csv_rows(cc, AZURE_BLOB_NAME)
+        today_iso = scrape_date.isoformat()
+        symbols_to_deactivate = {r["symbol"] for r in new_rows}  # jen symboly, pro které dnes přidáváme
+        changed = deactivate_today_for_symbols(existing, today_iso, symbols_to_deactivate)
+        dlog("[csv] deactivated_today=%s symbols=%s", changed, len(symbols_to_deactivate))
+
+        # 5) připiš nové aktivní řádky
         all_rows = existing + new_rows
         dlog("[csv] newly_added=%s final_rows=%s", len(new_rows), len(all_rows))
         write_csv_rows(cc, AZURE_BLOB_NAME, all_rows)
