@@ -14,7 +14,7 @@ import requests
 from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
 
-VERSION = "8.4-debug-dump"
+VERSION = "8.5-debug-dump+full-html"
 
 # Azure
 STORAGE_CONNECTION_STRING = os.getenv("AzureWebJobsStorage")
@@ -28,7 +28,7 @@ COINLIST_BLOB = os.getenv("COINLIST_BLOB", "CoinList.csv")
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "45"))
 DETAIL_SLEEP_MS = int(os.getenv("DETAIL_SLEEP_MS", "120"))
 HEADERS = {
-    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/8.4)"),
+    "User-Agent": os.getenv("HTTP_USER_AGENT", "Mozilla/5.0 (compatible; CoincodexPredictionsFunc/8.5)"),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
@@ -36,18 +36,19 @@ HEADERS = {
 }
 DETAIL_TMPL = "https://coincodex.com/crypto/{slug}/price-prediction/"
 
+# Horizonty
 HORIZON_MAP = {
     "5D": ("5D", lambda d: d + relativedelta(days=5)),
     "1M": ("1M", lambda d: d + relativedelta(months=1)),
     "3M": ("3M", lambda d: d + relativedelta(months=3)),
 }
 
-# CSV schema – rozšířeno o debug sloupce
+# CSV schema – přidán html_blob a zvětšen minified
 CSV_FIELDS = [
     "scrape_date", "load_ts", "symbol", "slug", "token_name",
     "current_price",
     "horizon", "model_to", "predicted_price", "predicted_change_pct",
-    "page_url", "html_len",
+    "page_url", "html_len", "html_blob",
     "current_block", "pred5d_block", "pred1m_block", "pred3m_block",
     "raw_html_minified",
     "is_active", "validation"
@@ -105,6 +106,21 @@ def fetch_prediction_detail(session: requests.Session, slug: str) -> Optional[st
         dlog("[detail] error slug=%s: %s", slug, e)
     return None
 
+# ========= Upload full HTML =========
+def upload_full_html(container_client, slug: str, scrape_date: dt.date, load_ts: str, html: str) -> str:
+    """
+    Uloží celé HTML do blobu: html/{slug}/{YYYY-MM-DD}/{HHMMSS}.html
+    Vrací blob path (bez SAS).
+    """
+    safe_slug = re.sub(r"[^a-z0-9\-]", "-", slug.lower())
+    ts = load_ts.replace(":", "").replace("-", "")
+    hhmmss = ts.split("T")[1].split(".")[0] if "T" in ts else ts[-6:]
+    blob_path = f"html/{safe_slug}/{scrape_date.isoformat()}/{hhmmss}.html"
+    bc = container_client.get_blob_client(blob_path)
+    bc.upload_blob(html.encode("utf-8"), overwrite=True)
+    dlog("[html] saved -> %s", blob_path)
+    return blob_path
+
 # ========= Parsování (vrací i DEBUG bloky) =========
 def extract_current_price_and_block(soup: BeautifulSoup, slug: str) -> Tuple[Optional[Decimal], str]:
     # 1) topbar
@@ -136,7 +152,7 @@ def extract_current_price_and_block(soup: BeautifulSoup, slug: str) -> Tuple[Opt
         for n in soup.find_all(string=rx):
             blk = None
             for anc in getattr(n, "parents", []):
-                if getattr(anc, "name", "").lower() in SAFE_LABEL_BLOCKS:
+                if getattr(anc, "name", "").lower() in ("tr","li","div","section","article","p"):
                     t = _txt(anc)
                     if "$" in t:
                         blk = anc
@@ -151,15 +167,7 @@ def extract_current_price_and_block(soup: BeautifulSoup, slug: str) -> Tuple[Opt
 
     return None, ""
 
-RX_5D = [re.compile(r"\b5\s*D\b", re.I), re.compile(r"\b5\s*-\s*Day\b", re.I), re.compile(r"\b5\s*Day\b", re.I)]
-RX_1M = [re.compile(r"\b1\s*M\b", re.I), re.compile(r"\b1\s*-\s*Month\b", re.I), re.compile(r"\b1\s*Month\b", re.I)]
-RX_3M = [re.compile(r"\b3\s*M\b", re.I), re.compile(r"\b3\s*-\s*Month\b", re.I), re.compile(r"\b3\s*Month\b", re.I)]
-
 def parse_predictions_blocks(soup: BeautifulSoup) -> Dict[str, Dict[str, Optional[str]]]:
-    """
-    Vrátí bloky textu pro 5D/1M/3M (pro debug) + z nich spočítané ceny/%. 
-    {'5D': {'block': '...','price': Decimal|None,'pct': Decimal|None}, ...}
-    """
     out = {"5D": {"block":"", "price":None, "pct":None},
            "1M": {"block":"", "price":None, "pct":None},
            "3M": {"block":"", "price":None, "pct":None}}
@@ -183,7 +191,6 @@ def parse_predictions_blocks(soup: BeautifulSoup) -> Dict[str, Dict[str, Optiona
         if node:
             box = nearest_box_with_symbols(node)
         if not box:
-            # fallback: projdi boxy a hledej label v textu
             for b in soup.find_all(["div","section","article","li","tr"]):
                 t = _txt(b)
                 if t and rx.search(t) and ("$" in t or "%" in t):
@@ -191,8 +198,8 @@ def parse_predictions_blocks(soup: BeautifulSoup) -> Dict[str, Dict[str, Optiona
                     break
         if box:
             t = _txt(box)
-            out[key]["block"] = t
             price, pct = parse_price_and_pct(t)
+            out[key]["block"] = t
             out[key]["price"] = price
             out[key]["pct"]   = pct
 
@@ -204,7 +211,6 @@ def parse_prediction_detail(html: str, slug: str) -> Dict[str, Optional[Decimal]
     current_price, current_block = extract_current_price_and_block(soup, slug)
     blocks = parse_predictions_blocks(soup)
 
-    # sestav návrat + debug texty
     result = {
         "current_price": current_price,
         "current_block": current_block,
@@ -213,7 +219,6 @@ def parse_prediction_detail(html: str, slug: str) -> Dict[str, Optional[Decimal]
         "pred_3m": blocks["3M"]["price"], "chg_3m": blocks["3M"]["pct"], "pred3m_block": blocks["3M"]["block"],
     }
 
-    # dopočet % z current_price pokud chybí
     def pct_from_prices(pred: Optional[Decimal], base: Optional[Decimal]) -> Optional[Decimal]:
         try:
             if pred is None or base is None or base == 0:
@@ -293,7 +298,7 @@ def load_coinlist_from_blob(container_client, blob_name: str) -> List[Dict]:
     return out
 
 # ========= Sběr =========
-def collect_predictions_by_slug(coinlist: List[Dict]) -> List[Dict]:
+def collect_predictions_by_slug(coinlist: List[Dict], container_client, scrape_date: dt.date, load_ts: str) -> List[Dict]:
     session = requests.Session()
     session.headers.update(HEADERS)
 
@@ -306,24 +311,29 @@ def collect_predictions_by_slug(coinlist: List[Dict]) -> List[Dict]:
 
         html = fetch_prediction_detail(session, slug)
         if not html:
-            # i tak založíme RAW řádek s minimem info
             out.append({
                 "symbol": symbol, "slug": slug, "token_name": token_name,
-                "page_url": url, "html_len": 0, "raw_html_minified": "",
+                "page_url": url, "html_len": 0, "html_blob": "",
+                "raw_html_minified": "",
                 "current_price": None,
                 "current_block": "", "pred5d_block": "", "pred1m_block": "", "pred3m_block": "",
                 "pred_5d": None, "chg_5d": None, "pred_1m": None, "chg_1m": None, "pred_3m": None, "chg_3m": None,
             })
             continue
 
+        # uložit celé HTML
+        blob_path = upload_full_html(container_client, slug, scrape_date, load_ts, html)
+
         parsed = parse_prediction_detail(html, slug)
+
         raw_min = normalize_text(html)
-        if len(raw_min) > 5000:
-            raw_min = raw_min[:5000]
+        if len(raw_min) > 20000:  # větší okno pro ladění
+            raw_min = raw_min[:20000]
 
         item = {
             "symbol": symbol, "slug": slug, "token_name": token_name,
-            "page_url": url, "html_len": len(html), "raw_html_minified": raw_min,
+            "page_url": url, "html_len": len(html), "html_blob": blob_path,
+            "raw_html_minified": raw_min,
             **parsed
         }
         out.append(item)
@@ -344,20 +354,15 @@ def build_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[Di
         curr = it.get("current_price")
         curr_s = "" if curr is None else str(curr)
 
-        # 1) vždy ulož RAW řádek
-        rows.append({
+        base_common = {
             "scrape_date": scrape_date.isoformat(),
             "load_ts": load_ts,
             "symbol": symbol,
             "slug": slug,
             "token_name": token_name,
-            "current_price": curr_s,
-            "horizon": "RAW",
-            "model_to": "",
-            "predicted_price": "",
-            "predicted_change_pct": "",
             "page_url": it.get("page_url",""),
             "html_len": str(it.get("html_len","")),
+            "html_blob": it.get("html_blob",""),
             "current_block": it.get("current_block",""),
             "pred5d_block": it.get("pred5d_block",""),
             "pred1m_block": it.get("pred1m_block",""),
@@ -365,9 +370,19 @@ def build_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[Di
             "raw_html_minified": it.get("raw_html_minified",""),
             "is_active": "True",
             "validation": ""
+        }
+
+        # 1) RAW řádek vždy
+        rows.append({
+            **base_common,
+            "current_price": curr_s,
+            "horizon": "RAW",
+            "model_to": "",
+            "predicted_price": "",
+            "predicted_change_pct": "",
         })
 
-        # 2) pokud jsou predikce, přidej standardní 5D/1M/3M řádky
+        # 2) predikční řádky (pokud něco je)
         pairs = [
             ("5D", it.get("pred_5d"), it.get("chg_5d")),
             ("1M", it.get("pred_1m"), it.get("chg_1m")),
@@ -379,25 +394,12 @@ def build_rows(scrape_date: dt.date, load_ts: str, items: List[Dict]) -> List[Di
             _, to_fn = HORIZON_MAP[short]
             model_to = to_fn(scrape_date)
             rows.append({
-                "scrape_date": scrape_date.isoformat(),
-                "load_ts": load_ts,
-                "symbol": symbol,
-                "slug": slug,
-                "token_name": token_name,
+                **base_common,
                 "current_price": curr_s,
                 "horizon": short,
                 "model_to": model_to.isoformat(),
                 "predicted_price": "" if price is None else str(price),
                 "predicted_change_pct": "" if pct is None else str(pct),
-                "page_url": it.get("page_url",""),
-                "html_len": str(it.get("html_len","")),
-                "current_block": it.get("current_block",""),
-                "pred5d_block": it.get("pred5d_block",""),
-                "pred1m_block": it.get("pred1m_block",""),
-                "pred3m_block": it.get("pred3m_block",""),
-                "raw_html_minified": it.get("raw_html_minified",""),
-                "is_active": "True",
-                "validation": ""
             })
     return rows
 
@@ -428,20 +430,11 @@ def main(mytimer: func.TimerRequest) -> None:
             dlog("[coinlist] empty -> stop")
             return
 
-        # 2) stáhni a poskládej položky (vždy i RAW)
-        items = collect_predictions_by_slug(coinlist)
+        # 2) stáhni a ulož detail + full HTML
+        items = collect_predictions_by_slug(coinlist, cc, scrape_date, load_ts)
 
-        # 3) (ne)deduplikuj — chceme vše logovat; když chceš, můžeš ponechat uniq dle symbolu
-        # uniq = {}
-        # for it in items: uniq[it["symbol"]] = it
-        # items = list(uniq.values())
-
-        # 4) CSV overwrite s deaktivací dnešních
+        # 3) CSV overwrite (bez deaktivace RAW; chceme historický log)
         existing = load_csv_rows(cc, AZURE_BLOB_NAME)
-        deact = 0
-        # pokud nechceš zneaktivňovat RAW, nech to na 0:
-        # deact = deactivate_todays_rows(existing, scrape_date.isoformat())
-
         new_rows = build_rows(scrape_date, load_ts, items)
         all_rows = existing + new_rows
         dlog("[csv] newly_added=%s final_rows=%s", len(new_rows), len(all_rows))
