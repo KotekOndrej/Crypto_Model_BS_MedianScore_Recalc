@@ -1,129 +1,104 @@
 import logging
-import os
-from io import BytesIO
-from datetime import datetime, date
-from zoneinfo import ZoneInfo
-from typing import Optional, Tuple
+raise RuntimeError(f"CoinDeskModels.csv is missing required columns: {missing}")
 
 
-import pandas as pd
-from azure.storage.blob import BlobServiceClient
-import azure.functions as func
+# Ensure derived columns exist
+models_df = _ensure_columns(models_df, {
+COL_VALIDATED: False,
+COL_VALIDATED_ON: None,
+COL_HIT_TYPE: None,
+COL_HIT_PRICE: None,
+COL_MIN_LOW: None,
+COL_MIN_LOW_DATE: None,
+COL_MAX_HIGH: None,
+COL_MAX_HIGH_DATE: None,
+COL_VALIDATION_CLOSED: False,
+})
 
 
-# =============================
-# Constants / Configuration
-# =============================
-CONTAINER_MODELS = "models-recalc" # per user requirement: hardcode container for models
-CONTAINER_MARKET = "market-data" # container with daily OHLC data
-MODEL_BLOB_NAME = "CoinDeskModels.csv"
-SUMMARY_BLOB_NAME = "CoinDeskModels_Summary.csv"
-TIMEZONE = ZoneInfo("Europe/Prague")
+# Normalize date columns
+models_df[COL_START] = models_df[COL_START].apply(lambda v: _parse_date_safe(v).isoformat() if _parse_date_safe(v) else None)
+models_df[COL_END] = models_df[COL_END].apply(lambda v: _parse_date_safe(v).isoformat() if _parse_date_safe(v) else None)
 
 
-# Column names in CoinDeskModels
-COL_TOKEN = "symbol"
-COL_HORIZON = "horizon"
-COL_PCT = "predicted_change_pct"
-COL_PRICE = "predicted_price"
-COL_START = "scrape_date"
-COL_END = "model_to"
-COL_IS_ACTIVE = "is_active"
+# 2) Only active
+active_mask = models_df[COL_IS_ACTIVE] == True
+active_rows = models_df[active_mask].copy()
+logging.info(f"Active predictions: {len(active_rows)}")
+if active_rows.empty:
+logging.info("No active predictions. Writing summary and exiting.")
+empty_summary = _build_summary(models_df.iloc[0:0])
+_upload_df_as_csv(container_models, SUMMARY_BLOB_NAME, empty_summary)
+_upload_df_as_csv(container_models, MODEL_BLOB_NAME, models_df)
+return
 
 
-# New/derived columns to (re)compute
-COL_VALIDATED = "validated"
-COL_VALIDATED_ON = "validated_on"
-COL_HIT_TYPE = "hit_type" # "low" | "high" (based on sign of predicted_change_pct)
-COL_HIT_PRICE = "hit_price"
-COL_MIN_LOW = "min_low"
-COL_MIN_LOW_DATE = "min_low_date"
-COL_MAX_HIGH = "max_high"
-COL_MAX_HIGH_DATE = "max_high_date"
-COL_VALIDATION_CLOSED = "validation_closed"
+token_to_daily_df: dict[str, pd.DataFrame] = {}
 
 
+for idx, row in active_rows.iterrows():
+token = str(row.get(COL_TOKEN)).strip() if pd.notna(row.get(COL_TOKEN)) else None
+if not token:
+logging.warning(f"Row {idx} has empty token; skipping.")
+continue
 
 
-# =============================
-# Helpers
-# =============================
+if token not in token_to_daily_df:
+token_blob_name = f"1D/{token}USDC.csv"
+logging.info(f"Preparing to load daily CSV for token '{token}' -> '{token_blob_name}'")
+if not _check_blob_exists(container_market, token_blob_name):
+logging.warning(f"Daily blob not found: '{token_blob_name}'. Listing candidates with prefix '1D/{token}'…")
+_list_blobs_with_prefix(container_market, prefix=f"1D/{token}")
+daily_df = _download_csv_as_df(container_market, token_blob_name)
+if daily_df is None:
+logging.warning(f"Daily CSV for token '{token}' not found or unreadable. Using empty frame.")
+token_to_daily_df[token] = pd.DataFrame(columns=["date", "open", "high", "low", "close"])
+else:
+# normalize columns (case-insensitive)
+cols_map = {c.lower(): c for c in daily_df.columns}
+for expected in ["date", "open", "high", "low", "close"]:
+if expected not in cols_map:
+logging.warning(f"Daily CSV '{token_blob_name}' missing column '{expected}'. Creating empty column.")
+daily_df[expected] = pd.NA
+else:
+src = cols_map[expected]
+if src != expected:
+daily_df.rename(columns={src: expected}, inplace=True)
+keep = ["date", "open", "high", "low", "close"]
+daily_df = daily_df[keep]
+logging.info(f"Loaded daily for {token}: rows={len(daily_df)}")
+token_to_daily_df[token] = daily_df
 
 
-def _get_blob_service() -> BlobServiceClient:
-conn_str = os.getenv("AzureWebJobsStorage")
-if not conn_str:
-raise RuntimeError("AzureWebJobsStorage env var is not set.")
-return BlobServiceClient.from_connection_string(conn_str)
+daily_df = token_to_daily_df[token]
 
 
+start_d = _parse_date_safe(row.get(COL_START))
+end_d = _parse_date_safe(row.get(COL_END))
+logging.info(f"Row {idx} | token={token} | interval={start_d}..{end_d} | price={row.get(COL_PRICE)} | pct={row.get(COL_PCT)}")
 
 
-def _download_csv_as_df(container_client, blob_name: str) -> Optional[pd.DataFrame]:
-try:
-blob_client = container_client.get_blob_client(blob_name)
-stream = blob_client.download_blob(max_concurrency=1).readall()
-try:
-df = pd.read_csv(BytesIO(stream), encoding="utf-8-sig")
-except UnicodeDecodeError:
-df = pd.read_csv(BytesIO(stream), encoding="utf-8")
-return df
+interval_df = _filter_interval(daily_df, start_d, end_d)
+logging.info(f"Row {idx} | interval rows={len(interval_df)}")
+
+
+vals = _validate_row(row, interval_df)
+for k, v in vals.items():
+models_df.at[idx, k] = v
+
+
+# 3) Upload updated models CSV (overwrite)
+_upload_df_as_csv(container_models, MODEL_BLOB_NAME, models_df)
+
+
+# 4) Build & upload summary CSV (overwrite)
+summary_df = _build_summary(models_df)
+_upload_df_as_csv(container_models, SUMMARY_BLOB_NAME, summary_df)
+
+
+logging.info("[CoinDesk Validation] Completed successfully.")
+
+
 except Exception as e:
-logging.warning(f"Could not download or parse CSV '{blob_name}': {e}")
-return None
-
-
-
-
-def _upload_df_as_csv(container_client, blob_name: str, df: pd.DataFrame) -> None:
-csv_bytes = df.to_csv(index=False).encode("utf-8")
-container_client.upload_blob(name=blob_name, data=csv_bytes, overwrite=True)
-logging.info(f"Uploaded CSV -> {blob_name} ({len(df)} rows)")
-
-
-
-
-def _parse_date_safe(val) -> Optional[date]:
-if pd.isna(val):
-return None
-try:
-dt = pd.to_datetime(val, utc=False).date()
-return dt
-except Exception:
-return None
-
-
-
-
-def _ensure_columns(df: pd.DataFrame, columns_with_defaults: dict) -> pd.DataFrame:
-for col, default in columns_with_defaults.items():
-if col not in df.columns:
-df[col] = default
-return df
-
-
-
-
-def _first_hit_date(interval_df: pd.DataFrame, condition_series: pd.Series) -> Optional[date]:
-hit_idx = condition_series[condition_series].index
-if len(hit_idx) == 0:
-return None
-first_idx = hit_idx[0]
-d = interval_df.loc[first_idx, "date"]
-return _parse_date_safe(d)
-
-
-
-
-def _min_low_with_date(interval_df: pd.DataFrame) -> Tuple[Optional[float], Optional[date]]:
-if interval_df.empty or "low" not in interval_df.columns:
-return None, None
-idx = interval_df["low"].astype(float).idxmin()
-if pd.isna(idx):
-return None, None
-return float(interval_df.loc[idx, "low"]), _parse_date_safe(interval_df.loc[idx, "date"])
-
-
-
-
+logging.exception(f"[CoinDesk Validation] Failed with error: {e}")
 raise
