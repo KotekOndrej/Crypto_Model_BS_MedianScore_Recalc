@@ -394,3 +394,54 @@ def main(myTimer: func.TimerRequest) -> None:
     except Exception as e:
         logging.exception(f"[CoinDesk Validation] Failed with error: {e}")
         raise
+
+
+# =============================
+# function.json (place in the same function folder)
+# Folder name should be: CoinDeskModelsEvaluation
+# =============================
+# {
+#   "scriptFile": "__init__.py",
+#   "entryPoint": "main",
+#   "bindings": [
+#     {
+#       "name": "myTimer",
+#       "type": "timerTrigger",
+#       "direction": "in",
+#       "schedule": "0 0 15 * * *"  
+#     }
+#   ]
+# }
+
+# =============================
+# host.json (root of the Function App)
+# =============================
+# {
+#   "version": "2.0",
+#   "logging": {
+#     "applicationInsights": {
+#       "samplingSettings": {
+#         "isEnabled": true
+#       }
+#     }
+#   }
+# }
+
+# =============================
+# requirements.txt (root or function folder)
+# =============================
+# azure-functions
+# azure-storage-blob>=12.19.0
+# pandas>=2.0.0
+# pytz>=2023.3  # optional; used only if zoneinfo unavailable
+
+# =============================
+# local.settings.json (for local run; do NOT deploy to production)
+# =============================
+# {
+#   "IsEncrypted": false,
+#   "Values": {
+#     "AzureWebJobsStorage": "<YourConnectionString>",
+#     "FUNCTIONS_WORKER_RUNTIME": "python"
+#   }
+# }
