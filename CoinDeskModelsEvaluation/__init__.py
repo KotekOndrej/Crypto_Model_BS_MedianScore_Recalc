@@ -1,4 +1,8 @@
 import logging
+required_cols = [COL_TOKEN, COL_HORIZON, COL_PCT, COL_PRICE, COL_START, COL_END, COL_IS_ACTIVE]
+missing = [c for c in required_cols if c not in models_df.columns]
+if missing:
+logging.error(f"Missing required columns in models: {missing}")
 raise RuntimeError(f"CoinDeskModels.csv is missing required columns: {missing}")
 
 
@@ -33,7 +37,7 @@ _upload_df_as_csv(container_models, MODEL_BLOB_NAME, models_df)
 return
 
 
-token_to_daily_df: dict[str, pd.DataFrame] = {}
+token_to_daily_df: Dict[str, pd.DataFrame] = {}
 
 
 for idx, row in active_rows.iterrows():
