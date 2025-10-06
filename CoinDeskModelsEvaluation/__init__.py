@@ -15,6 +15,7 @@ CONTAINER_MODELS = "models-recalc"  # hardcoded per user
 CONTAINER_MARKET = "market-data"    # container with daily OHLC data
 MODEL_BLOB_NAME = "CoinDeskModels.csv"
 SUMMARY_BLOB_NAME = "CoinDeskModels_Summary.csv"
+EVALUATION_BLOB_NAME = "CoinDeskModelsEvaluation.csv"
 # Timezone handling with fallbacks (Py3.8 safe)
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -65,6 +66,7 @@ def _download_csv_as_df(container_client, blob_name: str) -> Optional[pd.DataFra
     try:
         blob_client = container_client.get_blob_client(blob_name)
         stream = blob_client.download_blob(max_concurrency=1).readall()
+        # Support gzip if needed in future
         try:
             df = pd.read_csv(BytesIO(stream), encoding="utf-8-sig")
         except UnicodeDecodeError:
@@ -220,9 +222,31 @@ def _filter_interval(df: pd.DataFrame, start_d: Optional[date], end_d: Optional[
     if start_d is None or end_d is None or df.empty:
         return df.iloc[0:0]
     df = df.copy()
-    df["date"] = df["date"].apply(_parse_date_safe)
-    mask = (df["date"] >= start_d) & (df["date"] <= end_d)
-    return df.loc[mask].sort_values("date").reset_index(drop=True)
+    # --- Derive 'date' robustly ---
+    cols_lower = {c.lower(): c for c in df.columns}
+    if 'date' not in df.columns:
+        if 'closetimeiso' in cols_lower:
+            df['date'] = pd.to_datetime(df[cols_lower['closetimeiso']]).dt.date
+        elif 'opentime' in cols_lower:
+            df['date'] = pd.to_datetime(df[cols_lower['opentime']], unit='ms').dt.date
+        elif 'closetime' in cols_lower:
+            df['date'] = pd.to_datetime(df[cols_lower['closetime']], unit='ms').dt.date
+        else:
+            # As a last resort, try first datetime-like column
+            for c in df.columns:
+                if 'time' in c.lower() or 'date' in c.lower():
+                    df['date'] = pd.to_datetime(df[c], errors='coerce').dt.date
+                    break
+    # Ensure numeric types on OHLC
+    for k in ['open','high','low','close']:
+        src = cols_lower.get(k)
+        if src and src != k and k not in df.columns:
+            df[k] = df[src]
+        if k in df.columns:
+            df[k] = pd.to_numeric(df[k], errors='coerce')
+    df['date'] = df['date'].apply(_parse_date_safe)
+    mask = (df['date'] >= start_d) & (df['date'] <= end_d)
+    return df.loc[mask].sort_values('date').reset_index(drop=True)
 
 
 def _build_summary(models_df: pd.DataFrame) -> pd.DataFrame:
@@ -336,44 +360,29 @@ def main(myTimer: func.TimerRequest) -> None:
             return
 
         token_to_daily_df: Dict[str, pd.DataFrame] = {}
+        evaluation_rows = []
 
         for idx, row in active_rows.iterrows():
-            token = str(row.get(COL_TOKEN)).strip() if pd.notna(row.get(COL_TOKEN)) else None
-            if not token:
-                logging.warning(f"Row {idx} has empty token; skipping.")
+            token_raw = str(row.get(COL_TOKEN)).strip() if pd.notna(row.get(COL_TOKEN)) else None
+            if not token_raw:
+                logging.warning(f"Row {idx} has empty symbol; skipping.")
                 continue
+            token_uc = token_raw.upper()
+            market_symbol = token_uc if token_uc.endswith('USDC') else f"{token_uc}USDC"
+            token_blob_name = f"1D/{market_symbol}.csv"
+            logging.info(f"Loading daily CSV for '{token_uc}' -> '{token_blob_name}'")
 
-            if token not in token_to_daily_df:
-                token_blob_name = f"1D/{token}USDC.csv"
-                logging.info(f"Preparing to load daily CSV for token '{token}' -> '{token_blob_name}'")
+            daily_df = token_to_daily_df.get(market_symbol)
+            if daily_df is None:
                 if not _check_blob_exists(container_market, token_blob_name):
-                    logging.warning(f"Daily blob not found: '{token_blob_name}'. Listing candidates with prefix '1D/{token}'…")
-                    _list_blobs_with_prefix(container_market, prefix=f"1D/{token}")
-                daily_df = _download_csv_as_df(container_market, token_blob_name)
-                if daily_df is None:
-                    logging.warning(f"Daily CSV for token '{token}' not found or unreadable. Using empty frame.")
-                    token_to_daily_df[token] = pd.DataFrame(columns=["date", "open", "high", "low", "close"])
-                else:
-                    # normalize columns (case-insensitive)
-                    cols_map = {c.lower(): c for c in daily_df.columns}
-                    for expected in ["date", "open", "high", "low", "close"]:
-                        if expected not in cols_map:
-                            logging.warning(f"Daily CSV '{token_blob_name}' missing column '{expected}'. Creating empty column.")
-                            daily_df[expected] = pd.NA
-                        else:
-                            src = cols_map[expected]
-                            if src != expected:
-                                daily_df.rename(columns={src: expected}, inplace=True)
-                    keep = ["date", "open", "high", "low", "close"]
-                    daily_df = daily_df[keep]
-                    logging.info(f"Loaded daily for {token}: rows={len(daily_df)}")
-                    token_to_daily_df[token] = daily_df
-
-            daily_df = token_to_daily_df[token]
+                    logging.warning(f"Daily blob not found: '{token_blob_name}'. Listing candidates with prefix '1D/{token_uc}'…")
+                    _list_blobs_with_prefix(container_market, prefix=f"1D/{token_uc}")
+                daily_df = _download_csv_as_df(container_market, token_blob_name) or pd.DataFrame()
+                token_to_daily_df[market_symbol] = daily_df
 
             start_d = _parse_date_safe(row.get(COL_START))
             end_d = _parse_date_safe(row.get(COL_END))
-            logging.info(f"Row {idx} | token={token} | interval={start_d}..{end_d} | price={row.get(COL_PRICE)} | pct={row.get(COL_PCT)}")
+            logging.info(f"Row {idx} | symbol={token_uc} | interval={start_d}..{end_d} | price={row.get(COL_PRICE)} | pct={row.get(COL_PCT)}")
 
             interval_df = _filter_interval(daily_df, start_d, end_d)
             logging.info(f"Row {idx} | interval rows={len(interval_df)}")
@@ -382,8 +391,40 @@ def main(myTimer: func.TimerRequest) -> None:
             for k, v in vals.items():
                 models_df.at[idx, k] = v
 
+            evaluation_rows.append({
+                COL_TOKEN: token_uc,
+                COL_HORIZON: row.get(COL_HORIZON),
+                COL_START: start_d.isoformat() if start_d else None,
+                COL_END: end_d.isoformat() if end_d else None,
+                COL_PRICE: float(row.get(COL_PRICE)) if pd.notna(row.get(COL_PRICE)) else None,
+                COL_PCT: float(row.get(COL_PCT)) if pd.notna(row.get(COL_PCT)) else None,
+                COL_HIT_TYPE: vals.get(COL_HIT_TYPE),
+                COL_VALIDATED: vals.get(COL_VALIDATED),
+                COL_VALIDATED_ON: vals.get(COL_VALIDATED_ON),
+                COL_HIT_PRICE: vals.get(COL_HIT_PRICE),
+                COL_MIN_LOW: vals.get(COL_MIN_LOW),
+                COL_MIN_LOW_DATE: vals.get(COL_MIN_LOW_DATE),
+                COL_MAX_HIGH: vals.get(COL_MAX_HIGH),
+                COL_MAX_HIGH_DATE: vals.get(COL_MAX_HIGH_DATE),
+                COL_VALIDATION_CLOSED: vals.get(COL_VALIDATION_CLOSED),
+                'last_run_utc': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            })
+
         # 3) Upload updated models CSV (overwrite)
         _upload_df_as_csv(container_models, MODEL_BLOB_NAME, models_df)
+
+        # 3b) Upload evaluation CSV (overwrite)
+        evaluation_df = pd.DataFrame(evaluation_rows, columns=[
+            COL_TOKEN, COL_HORIZON, COL_START, COL_END, COL_PRICE, COL_PCT,
+            COL_HIT_TYPE, COL_VALIDATED, COL_VALIDATED_ON, COL_HIT_PRICE,
+            COL_MIN_LOW, COL_MIN_LOW_DATE, COL_MAX_HIGH, COL_MAX_HIGH_DATE,
+            COL_VALIDATION_CLOSED, 'last_run_utc'
+        ])
+        _upload_df_as_csv(container_models, EVALUATION_BLOB_NAME, evaluation_df)
+
+        # 4) Build & upload summary CSV (overwrite)
+        summary_df = _build_summary(models_df)
+        _upload_df_as_csv(container_models, SUMMARY_BLOB_NAME, summary_df)
 
         # 4) Build & upload summary CSV (overwrite)
         summary_df = _build_summary(models_df)
