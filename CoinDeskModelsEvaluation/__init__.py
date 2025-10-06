@@ -377,7 +377,8 @@ def main(myTimer: func.TimerRequest) -> None:
                 if not _check_blob_exists(container_market, token_blob_name):
                     logging.warning(f"Daily blob not found: '{token_blob_name}'. Listing candidates with prefix '1D/{token_uc}'…")
                     _list_blobs_with_prefix(container_market, prefix=f"1D/{token_uc}")
-                daily_df = _download_csv_as_df(container_market, token_blob_name) or pd.DataFrame()
+                _tmp_df = _download_csv_as_df(container_market, token_blob_name)
+                daily_df = _tmp_df if _tmp_df is not None else pd.DataFrame()
                 token_to_daily_df[market_symbol] = daily_df
 
             start_d = _parse_date_safe(row.get(COL_START))
