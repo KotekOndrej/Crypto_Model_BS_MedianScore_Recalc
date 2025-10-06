@@ -423,9 +423,73 @@ def main(myTimer: func.TimerRequest) -> None:
         ])
         _upload_df_as_csv(container_models, EVALUATION_BLOB_NAME, evaluation_df)
 
-        # 4) Build & upload summary CSV (overwrite)
-        summary_df = _build_summary(models_df)
-        _upload_df_as_csv(container_models, SUMMARY_BLOB_NAME, summary_df)
+        # 4) Build & upload summary CSV (overwrite) — now computed **from evaluation** only
+        #    We intentionally derive summary from EVALUATION_BLOB content so that
+        #    any future tweaks to evaluation logic automatically flow into summary.
+        try:
+            eval_df_for_summary = evaluation_df.copy()
+        except NameError:
+            # Fallback if evaluation_df var doesn't exist for some reason — try to (re)load it
+            eval_df_for_summary = _download_csv_as_df(container_models, EVALUATION_BLOB_NAME) or pd.DataFrame()
+
+        # Guard: if evaluation is empty, write an empty summary with headers
+        if eval_df_for_summary is None or eval_df_for_summary.empty:
+            logging.warning("Evaluation DF empty — writing empty summary.")
+            empty_summary = pd.DataFrame(columns=[
+                COL_TOKEN, COL_HORIZON, "n_all_active", "success_rate_all",
+                "n_neg", "success_rate_neg", "n_pos", "success_rate_pos", "last_run_utc"
+            ])
+            _upload_df_as_csv(container_models, SUMMARY_BLOB_NAME, empty_summary)
+        else:
+            # Map expected column names from evaluation
+            df = eval_df_for_summary.copy()
+            # Ensure types
+            df[COL_VALIDATED] = df.get(COL_VALIDATED, False).fillna(False).astype(bool)
+            # Sign bucket
+            def _bucket(x):
+                try:
+                    v = float(x)
+                    if v < 0: return "neg"
+                    if v > 0: return "pos"
+                    return "zero"
+                except Exception:
+                    return "nan"
+            df["_bucket"] = df.get(COL_PCT).apply(_bucket)
+
+            groups = []
+            for (token, horizon), g in df.groupby([COL_TOKEN, COL_HORIZON], dropna=False):
+                n_all = len(g)
+                succ_all = int(g[COL_VALIDATED].sum()) if n_all > 0 else 0
+                rate_all = (succ_all / n_all) if n_all > 0 else None
+
+                g_neg = g[g["_bucket"] == "neg"]
+                n_neg = len(g_neg)
+                succ_neg = int(g_neg[COL_VALIDATED].sum()) if n_neg > 0 else 0
+                rate_neg = (succ_neg / n_neg) if n_neg > 0 else None
+
+                g_pos = g[g["_bucket"] == "pos"]
+                n_pos = len(g_pos)
+                succ_pos = int(g_pos[COL_VALIDATED].sum()) if n_pos > 0 else 0
+                rate_pos = (succ_pos / n_pos) if n_pos > 0 else None
+
+                groups.append({
+                    COL_TOKEN: token,
+                    COL_HORIZON: horizon,
+                    "n_all_active": n_all,
+                    "success_rate_all": rate_all,
+                    "n_neg": n_neg,
+                    "success_rate_neg": rate_neg,
+                    "n_pos": n_pos,
+                    "success_rate_pos": rate_pos,
+                    "last_run_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                })
+
+            summary_df = pd.DataFrame(groups, columns=[
+                COL_TOKEN, COL_HORIZON, "n_all_active", "success_rate_all",
+                "n_neg", "success_rate_neg", "n_pos", "success_rate_pos", "last_run_utc"
+            ]).sort_values([COL_TOKEN, COL_HORIZON]).reset_index(drop=True)
+
+            _upload_df_as_csv(container_models, SUMMARY_BLOB_NAME, summary_df)
 
         # 4) Build & upload summary CSV (overwrite)
         summary_df = _build_summary(models_df)
