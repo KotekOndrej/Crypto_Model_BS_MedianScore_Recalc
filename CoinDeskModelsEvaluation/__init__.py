@@ -44,6 +44,7 @@ COL_MIN_LOW_DATE = "min_low_date"
 COL_MAX_HIGH = "max_high"
 COL_MAX_HIGH_DATE = "max_high_date"
 COL_VALIDATION_CLOSED = "validation_closed"
+COL_PRICE_VALIDATION = "price_validation"
 
 
 def _get_blob_service() -> BlobServiceClient:
@@ -209,6 +210,23 @@ def main(myTimer: func.TimerRequest) -> None:
             interval_df = _ensure_interval_and_ohlc(daily_df, start_d, end_d)
             vals = _validate_row(row, interval_df)
 
+            # Price sanity check on scrape_date: current_price vs low(scrape_date)
+            cp = row.get(COL_CURRENT_PRICE) if COL_CURRENT_PRICE in active_df.columns else None
+            try:
+                cp_val = float(cp) if pd.notna(cp) else None
+            except Exception:
+                cp_val = None
+            scrape_day_df = _ensure_interval_and_ohlc(daily_df, start_d, start_d)
+            if cp_val is None or scrape_day_df.empty or 'low' not in scrape_day_df.columns:
+                price_validation = None
+            else:
+                day_low = float(scrape_day_df['low'].min())
+                price_validation = bool(cp_val >= day_low)
+                if price_validation is False:
+                    # force overall validated to False if sanity check fails
+                    vals[COL_VALIDATED] = False
+            vals[COL_PRICE_VALIDATION] = price_validation
+
             record = {
                 COL_TOKEN: token,
                 COL_HORIZON: row.get(COL_HORIZON),
@@ -224,7 +242,7 @@ def main(myTimer: func.TimerRequest) -> None:
         evaluation_df = pd.DataFrame(eval_rows)
         ordered_cols = [
             COL_TOKEN, COL_HORIZON, COL_START, COL_END,
-            COL_PRICE, COL_PCT, COL_CURRENT_PRICE,
+            COL_PRICE, COL_PCT, COL_CURRENT_PRICE, COL_PRICE_VALIDATION,
             COL_HIT_TYPE, COL_VALIDATED, COL_VALIDATED_ON, COL_HIT_PRICE,
             COL_MIN_LOW, COL_MIN_LOW_DATE, COL_MAX_HIGH, COL_MAX_HIGH_DATE,
             COL_VALIDATION_CLOSED
