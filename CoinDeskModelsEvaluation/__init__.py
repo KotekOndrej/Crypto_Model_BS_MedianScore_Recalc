@@ -32,9 +32,9 @@ COL_PRICE = "predicted_price"
 COL_START = "scrape_date"
 COL_END = "model_to"
 COL_IS_ACTIVE = "is_active"
-COL_CURRENT_PRICE = "current_price"  # <-- new: propagate to evaluation
+COL_CURRENT_PRICE = "current_price"
 
-# New/derived columns (validation outputs)
+# New/derived columns
 COL_VALIDATED = "validated"
 COL_VALIDATED_ON = "validated_on"
 COL_HIT_TYPE = "hit_type"
@@ -45,10 +45,6 @@ COL_MAX_HIGH = "max_high"
 COL_MAX_HIGH_DATE = "max_high_date"
 COL_VALIDATION_CLOSED = "validation_closed"
 
-
-# =============================
-# Helpers
-# =============================
 
 def _get_blob_service() -> BlobServiceClient:
     conn_str = os.getenv("AzureWebJobsStorage")
@@ -89,14 +85,11 @@ def _parse_date_safe(val) -> Optional[date]:
 
 
 def _ensure_interval_and_ohlc(df: pd.DataFrame, start_d: Optional[date], end_d: Optional[date]) -> pd.DataFrame:
-    """Return DF filtered to inclusive [start_d, end_d] with robust 'date' derivation and numeric OHLC."""
     if start_d is None or end_d is None or df is None or df.empty:
-        return pd.DataFrame(columns=["date", "open", "high", "low", "close"])  # empty
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close"])
 
     df = df.copy()
     cols_lower = {c.lower(): c for c in df.columns}
-
-    # Derive date
     if "date" not in df.columns:
         if "closetimeiso" in cols_lower:
             df["date"] = pd.to_datetime(df[cols_lower["closetimeiso"]]).dt.date
@@ -105,32 +98,25 @@ def _ensure_interval_and_ohlc(df: pd.DataFrame, start_d: Optional[date], end_d: 
         elif "closetime" in cols_lower:
             df["date"] = pd.to_datetime(df[cols_lower["closetime"]], unit="ms").dt.date
         else:
-            # try any time-like column
             for c in df.columns:
                 if "time" in c.lower() or "date" in c.lower():
                     df["date"] = pd.to_datetime(df[c], errors="coerce").dt.date
                     break
     df["date"] = df["date"].apply(_parse_date_safe)
-
-    # Ensure OHLC and numeric
     for k in ["open", "high", "low", "close"]:
         src = cols_lower.get(k)
         if src and src != k and k not in df.columns:
             df[k] = df[src]
         if k in df.columns:
             df[k] = pd.to_numeric(df[k], errors="coerce")
-
     mask = (df["date"] >= start_d) & (df["date"] <= end_d)
-    out = df.loc[mask, [c for c in ["date","open","high","low","close"] if c in df.columns]].dropna(subset=["date"])\
-            .sort_values("date").reset_index(drop=True)
+    out = df.loc[mask, [c for c in ["date","open","high","low","close"] if c in df.columns]].dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     return out
 
 
 def _validate_row(row: pd.Series, daily_df: pd.DataFrame) -> Dict[str, object]:
     pred_price = float(row.get(COL_PRICE)) if pd.notna(row.get(COL_PRICE)) else None
     pct = row.get(COL_PCT)
-
-    # Determine which side to test
     hit_type = None
     if pd.notna(pct):
         try:
@@ -142,33 +128,27 @@ def _validate_row(row: pd.Series, daily_df: pd.DataFrame) -> Dict[str, object]:
         except Exception:
             pass
 
-    # Min/Max over interval
     min_low = float(daily_df["low"].min()) if "low" in daily_df.columns and not daily_df.empty else None
     max_high = float(daily_df["high"].max()) if "high" in daily_df.columns and not daily_df.empty else None
     min_low_date = daily_df.loc[daily_df["low"].idxmin(), "date"] if "low" in daily_df.columns and not daily_df.empty else None
     max_high_date = daily_df.loc[daily_df["high"].idxmax(), "date"] if "high" in daily_df.columns and not daily_df.empty else None
 
-    validated = False
-    validated_on = None
-    hit_price = None
-
+    validated = False; validated_on=None; hit_price=None
     if hit_type == "low" and pred_price is not None and not daily_df.empty:
-        cond = daily_df["low"] <= pred_price  # exact <= as requested
-        if cond.any():
-            first_idx = cond.index[cond.argmax()]  # first True by index order
-            validated = True
-            validated_on = daily_df.loc[first_idx, "date"]
-            hit_price = float(daily_df.loc[first_idx, "low"]) if "low" in daily_df.columns else None
-
-    elif hit_type == "high" and pred_price is not None and not daily_df.empty:
-        cond = daily_df["high"] >= pred_price  # exact >= as requested
+        cond = daily_df["low"] <= pred_price
         if cond.any():
             first_idx = cond.index[cond.argmax()]
             validated = True
             validated_on = daily_df.loc[first_idx, "date"]
-            hit_price = float(daily_df.loc[first_idx, "high"]) if "high" in daily_df.columns else None
+            hit_price = float(daily_df.loc[first_idx, "low"])
+    elif hit_type == "high" and pred_price is not None and not daily_df.empty:
+        cond = daily_df["high"] >= pred_price
+        if cond.any():
+            first_idx = cond.index[cond.argmax()]
+            validated = True
+            validated_on = daily_df.loc[first_idx, "date"]
+            hit_price = float(daily_df.loc[first_idx, "high"])
 
-    # validation_closed: today (Europe/Prague) > end_date
     if TIMEZONE is not None:
         try:
             today_local = datetime.now(TIMEZONE).date()
@@ -192,43 +172,27 @@ def _validate_row(row: pd.Series, daily_df: pd.DataFrame) -> Dict[str, object]:
     }
 
 
-# =============================
-# Function entry
-# =============================
-
 def main(myTimer: func.TimerRequest) -> None:
     logging.info("[CoinDesk Validation] Function starting — entering main()")
     try:
-        # Storage
         service = _get_blob_service()
         container_models = service.get_container_client(CONTAINER_MODELS)
         container_market = service.get_container_client(CONTAINER_MARKET)
 
-        # Load models and keep only active
         models_df = _download_csv_as_df(container_models, MODEL_BLOB_NAME)
         if models_df is None or models_df.empty:
             logging.error("CoinDeskModels.csv is missing or empty.")
             return
 
-        required = [COL_TOKEN, COL_HORIZON, COL_PCT, COL_PRICE, COL_START, COL_END, COL_IS_ACTIVE]
-        miss = [c for c in required if c not in models_df.columns]
-        if miss:
-            logging.error(f"CoinDeskModels.csv missing columns: {miss}")
-            return
-
         active_df = models_df[models_df[COL_IS_ACTIVE] == True].copy()
         if active_df.empty:
-            logging.info("No active rows to process.")
-            # Still write empty evaluation & summary for transparency
             _upload_df_as_csv(container_models, EVALUATION_BLOB_NAME, pd.DataFrame())
             _upload_df_as_csv(container_models, SUMMARY_BLOB_NAME, pd.DataFrame())
             return
 
-        # Normalize date columns in models (keep as dates for interval)
         active_df[COL_START] = active_df[COL_START].apply(_parse_date_safe)
         active_df[COL_END] = active_df[COL_END].apply(_parse_date_safe)
 
-        # Build evaluation rows
         eval_rows = []
         cache_daily: Dict[str, pd.DataFrame] = {}
 
@@ -236,17 +200,13 @@ def main(myTimer: func.TimerRequest) -> None:
             token = str(row[COL_TOKEN]).strip().upper()
             market_symbol = token if token.endswith("USDC") else f"{token}USDC"
             blob_name = f"1D/{market_symbol}.csv"
-
-            # Load or reuse daily CSV
-            if market_symbol not in cache_daily:
-                _tmp_daily = _download_csv_as_df(container_market, blob_name)
-                cache_daily[market_symbol] = _tmp_daily if _tmp_daily is not None else pd.DataFrame()
-            daily_df = cache_daily[market_symbol]
+            _tmp_daily = _download_csv_as_df(container_market, blob_name)
+            daily_df = _tmp_daily if _tmp_daily is not None else pd.DataFrame()
+            cache_daily[market_symbol] = daily_df
 
             start_d = _parse_date_safe(row[COL_START])
             end_d = _parse_date_safe(row[COL_END])
             interval_df = _ensure_interval_and_ohlc(daily_df, start_d, end_d)
-
             vals = _validate_row(row, interval_df)
 
             record = {
@@ -262,8 +222,6 @@ def main(myTimer: func.TimerRequest) -> None:
             eval_rows.append(record)
 
         evaluation_df = pd.DataFrame(eval_rows)
-
-        # Reorder columns for clarity
         ordered_cols = [
             COL_TOKEN, COL_HORIZON, COL_START, COL_END,
             COL_PRICE, COL_PCT, COL_CURRENT_PRICE,
@@ -275,26 +233,22 @@ def main(myTimer: func.TimerRequest) -> None:
             if c not in evaluation_df.columns:
                 evaluation_df[c] = None
         evaluation_df = evaluation_df[ordered_cols]
-
         _upload_df_as_csv(container_models, EVALUATION_BLOB_NAME, evaluation_df)
         logging.info(f"Created {EVALUATION_BLOB_NAME} with {len(evaluation_df)} rows.")
 
-        # =============================
-        # Create SUMMARY strictly from VALIDATED = TRUE in Evaluation
-        # =============================
+        # Build summary only from validated = TRUE or validation_closed = TRUE
         if not evaluation_df.empty:
             df = evaluation_df.copy()
             df[COL_VALIDATED] = df[COL_VALIDATED].fillna(False).astype(bool)
-            df = df[df[COL_VALIDATED] == True]
+            df[COL_VALIDATION_CLOSED] = df[COL_VALIDATION_CLOSED].fillna(False).astype(bool)
+            df = df[(df[COL_VALIDATED] == True) | (df[COL_VALIDATION_CLOSED] == True)]
 
             if df.empty:
-                logging.warning("No validated rows in evaluation — writing empty summary.")
                 _upload_df_as_csv(container_models, SUMMARY_BLOB_NAME, pd.DataFrame(columns=[
                     COL_TOKEN, COL_HORIZON, "n_all_active", "success_rate_all",
                     "n_neg", "success_rate_neg", "n_pos", "success_rate_pos", "last_run_utc"
                 ]))
             else:
-                # bucket by sign (still computed on validated subset)
                 def bucket(v):
                     try:
                         v = float(v)
@@ -303,20 +257,15 @@ def main(myTimer: func.TimerRequest) -> None:
                         return 'zero'
                     except: return 'nan'
                 df['_bucket'] = df[COL_PCT].apply(bucket)
-
                 groups = []
                 for (token, horizon), g in df.groupby([COL_TOKEN, COL_HORIZON], dropna=False):
-                    n_all = len(g)  # only validated rows
-                    succ_all = int(g[COL_VALIDATED].sum())  # equals n_all
-                    rate_all = succ_all / n_all if n_all else None  # will be 1.0
-
-                    g_neg = g[g['_bucket'] == 'neg']; n_neg = len(g_neg)
-                    g_pos = g[g['_bucket'] == 'pos']; n_pos = len(g_pos)
-                    succ_neg = int(g_neg[COL_VALIDATED].sum()) if n_neg else 0
-                    succ_pos = int(g_pos[COL_VALIDATED].sum()) if n_pos else 0
+                    n_all = len(g)
+                    succ_all = int(g[COL_VALIDATED].sum())
+                    rate_all = succ_all / n_all if n_all else None
+                    g_neg = g[g['_bucket']=='neg']; n_neg = len(g_neg); succ_neg = int(g_neg[COL_VALIDATED].sum()) if n_neg else 0
+                    g_pos = g[g['_bucket']=='pos']; n_pos = len(g_pos); succ_pos = int(g_pos[COL_VALIDATED].sum()) if n_pos else 0
                     rate_neg = succ_neg / n_neg if n_neg else None
                     rate_pos = succ_pos / n_pos if n_pos else None
-
                     groups.append({
                         COL_TOKEN: token,
                         COL_HORIZON: horizon,
@@ -328,12 +277,10 @@ def main(myTimer: func.TimerRequest) -> None:
                         'success_rate_pos': rate_pos,
                         'last_run_utc': datetime.utcnow().isoformat(timespec='seconds') + 'Z'
                     })
-
                 summary_df = pd.DataFrame(groups).sort_values([COL_TOKEN, COL_HORIZON]).reset_index(drop=True)
                 _upload_df_as_csv(container_models, SUMMARY_BLOB_NAME, summary_df)
-                logging.info(f"Created {SUMMARY_BLOB_NAME} with {len(summary_df)} rows.")
         else:
-            logging.warning("Evaluation DataFrame is empty — skipping summary.")
+            _upload_df_as_csv(container_models, SUMMARY_BLOB_NAME, pd.DataFrame())
 
     except Exception as e:
         logging.exception(f"[CoinDesk Validation] Failed with error: {e}")
