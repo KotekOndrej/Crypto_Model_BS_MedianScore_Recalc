@@ -239,7 +239,8 @@ def main(myTimer: func.TimerRequest) -> None:
 
             # Load or reuse daily CSV
             if market_symbol not in cache_daily:
-                cache_daily[market_symbol] = _download_csv_as_df(container_market, blob_name) or pd.DataFrame()
+                _tmp_daily = _download_csv_as_df(container_market, blob_name)
+                cache_daily[market_symbol] = _tmp_daily if _tmp_daily is not None else pd.DataFrame()
             daily_df = cache_daily[market_symbol]
 
             start_d = _parse_date_safe(row[COL_START])
