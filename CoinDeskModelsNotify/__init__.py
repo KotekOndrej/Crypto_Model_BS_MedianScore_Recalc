@@ -104,9 +104,17 @@ def _append_notify_csv(container_client, blob_name: str, new_df: pd.DataFrame, k
     add rows from new_df that are not present by key.
     key_cols default: [symbol, horizon, scrape_date]
     """
+    if new_df is None or new_df.empty:
+        # Ensure file exists with headers if it's missing
+        _tmp_existing = _download_csv_as_df(container_client, blob_name)
+        if _tmp_existing is None:
+            _upload_df_as_csv(container_client, blob_name, pd.DataFrame(columns=new_df.columns if new_df is not None else []))
+        return
+
     if key_cols is None:
         key_cols = [COL_TOKEN, COL_HORIZON, COL_START]
-    existing = _download_csv_as_df(container_client, blob_name) or pd.DataFrame(columns=new_df.columns)
+    _tmp_existing = _download_csv_as_df(container_client, blob_name)
+    existing = _tmp_existing if _tmp_existing is not None else pd.DataFrame(columns=new_df.columns)
     # Ensure the same columns order
     for c in new_df.columns:
         if c not in existing.columns:
@@ -114,6 +122,7 @@ def _append_notify_csv(container_client, blob_name: str, new_df: pd.DataFrame, k
     for c in existing.columns:
         if c not in new_df.columns:
             new_df[c] = None
+    existing = existing[new_df.columns]         new_df[c] = None
     existing = existing[new_df.columns]
 
     if existing.empty:
