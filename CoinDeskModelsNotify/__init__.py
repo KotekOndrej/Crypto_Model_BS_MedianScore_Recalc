@@ -20,9 +20,10 @@ import azure.functions as func
 #   - dedup last valid row per (symbol, horizon)
 #   - compute historical HIGH metrics from window = horizon * 3
 #   - include rows only if HIGH count in window >= horizon * 2
-# Output columns per row:
+# Output columns per row (and append-only behavior):
 #   symbol, horizon, current_price, predicted_price, predicted_change_pct,
-#   high_period_success_rate, high_period_count, scrape_date, model_to
+#   high_period_success_rate, high_period_count, scrape_date, model_to, generated_at (UTC)
+#   Existing Notify_High_*.csv files are LOADED and we APPEND only new (symbol,horizon,scrape_date)
 # ==============================================
 
 CONTAINER_MODELS = "models-recalc"
@@ -30,6 +31,9 @@ EVALUATION_BLOB_NAME = "CoinDeskModelsEvaluation.csv"
 NOTIFY_5D_BLOB = "Notify_High_5D.csv"
 NOTIFY_1M_BLOB = "Notify_High_1M.csv"
 NOTIFY_3M_BLOB = "Notify_High_3M.csv"
+
+# Notify columns
+COL_GENERATED_AT = "generated_at"
 
 # Timezone handling
 try:
@@ -94,6 +98,37 @@ def _upload_df_as_csv(container_client, blob_name: str, df: pd.DataFrame) -> Non
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     container_client.upload_blob(name=blob_name, data=csv_bytes, overwrite=True)
     logging.info(f"Uploaded {blob_name} ({len(df)} rows)")
+
+def _append_notify_csv(container_client, blob_name: str, new_df: pd.DataFrame, key_cols=None) -> None:
+    """Append-only write: load existing CSV if present, keep existing rows,
+    add rows from new_df that are not present by key.
+    key_cols default: [symbol, horizon, scrape_date]
+    """
+    if key_cols is None:
+        key_cols = [COL_TOKEN, COL_HORIZON, COL_START]
+    existing = _download_csv_as_df(container_client, blob_name) or pd.DataFrame(columns=new_df.columns)
+    # Ensure the same columns order
+    for c in new_df.columns:
+        if c not in existing.columns:
+            existing[c] = None
+    for c in existing.columns:
+        if c not in new_df.columns:
+            new_df[c] = None
+    existing = existing[new_df.columns]
+
+    if existing.empty:
+        out = new_df.copy()
+    else:
+        # Identify which new rows are not already present by key
+        # Use merge anti-join approach
+        marker = "__is_dup__"
+        merged = new_df.merge(existing[key_cols], on=key_cols, how='left', indicator=True)
+        to_add = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
+        # Re-extract only original columns from to_add (since it only carries key cols)
+        # Join back with new_df to keep full columns
+        to_add = to_add.merge(new_df, on=key_cols, how='left', suffixes=(None, None)).drop_duplicates(key_cols)
+        out = pd.concat([existing, to_add], ignore_index=True)
+    _upload_df_as_csv(container_client, blob_name, out)
 
 
 def _parse_date(val) -> Optional[date]:
@@ -202,10 +237,13 @@ def main(myTimer: func.TimerRequest) -> None:
 
         eval_df = _download_csv_as_df(cc_models, EVALUATION_BLOB_NAME)
         if eval_df is None or eval_df.empty:
-            logging.warning("Evaluation CSV missing/empty — writing empty notify CSVs")
-            _upload_df_as_csv(cc_models, NOTIFY_5D_BLOB, pd.DataFrame())
-            _upload_df_as_csv(cc_models, NOTIFY_1M_BLOB, pd.DataFrame())
-            _upload_df_as_csv(cc_models, NOTIFY_3M_BLOB, pd.DataFrame())
+            logging.warning("Evaluation CSV missing/empty — writing empty notify CSVs (no append)")
+            # Create empty frames with headers including generated_at
+            empty_cols = [COL_TOKEN, COL_HORIZON, 'current_price', 'predicted_price', 'predicted_change_pct',
+                          'high_period_success_rate', 'high_period_count', COL_START, COL_END, COL_GENERATED_AT]
+            _upload_df_as_csv(cc_models, NOTIFY_5D_BLOB, pd.DataFrame(columns=empty_cols))
+            _upload_df_as_csv(cc_models, NOTIFY_1M_BLOB, pd.DataFrame(columns=empty_cols))
+            _upload_df_as_csv(cc_models, NOTIFY_3M_BLOB, pd.DataFrame(columns=empty_cols))
             return
 
         eval_df = _prep_eval(eval_df)
@@ -216,9 +254,22 @@ def main(myTimer: func.TimerRequest) -> None:
         out_1m = _build_table(eval_df, '1M', today)
         out_3m = _build_table(eval_df, '3M', today)
 
-        _upload_df_as_csv(cc_models, NOTIFY_5D_BLOB, out_5d)
-        _upload_df_as_csv(cc_models, NOTIFY_1M_BLOB, out_1m)
-        _upload_df_as_csv(cc_models, NOTIFY_3M_BLOB, out_3m)
+        # Add generated_at UTC timestamp
+        gen_ts = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+        for df in (out_5d, out_1m, out_3m):
+            if not df.empty:
+                df[COL_GENERATED_AT] = gen_ts
+
+        # Append-only write per file using key (symbol,horizon,scrape_date)
+        _append_notify_csv(cc_models, NOTIFY_5D_BLOB, out_5d)
+        _append_notify_csv(cc_models, NOTIFY_1M_BLOB, out_1m)
+        _append_notify_csv(cc_models, NOTIFY_3M_BLOB, out_3m)
+
+        logging.info(f"Notify CSVs appended: 5D+={len(out_5d)} rows, 1M+={len(out_1m)} rows, 3M+={len(out_3m)} rows")
+
+    except Exception as e:
+        logging.exception(f"[Notify HIGH] Failed: {e}")
+        raise
 
         logging.info(f"Notify CSVs created: 5D={len(out_5d)} rows, 1M={len(out_1m)} rows, 3M={len(out_3m)} rows")
 
