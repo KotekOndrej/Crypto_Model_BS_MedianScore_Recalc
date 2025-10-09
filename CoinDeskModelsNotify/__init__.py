@@ -127,14 +127,11 @@ def _append_notify_csv(container_client, blob_name: str, new_df: pd.DataFrame, k
     if existing.empty:
         out = new_df.copy()
     else:
-        # Identify which new rows are not already present by key
-        # Use merge anti-join approach
-        marker = "__is_dup__"
-        merged = new_df.merge(existing[key_cols], on=key_cols, how='left', indicator=True)
-        to_add = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
-        # Re-extract only original columns from to_add (since it only carries key cols)
-        # Join back with new_df to keep full columns
-        to_add = to_add.merge(new_df, on=key_cols, how='left', suffixes=(None, None)).drop_duplicates(key_cols)
+        # Identify which new rows are not already present by key (left-anti join)
+        existing_keys = existing[key_cols].drop_duplicates() if not existing.empty else existing
+        anti = new_df.merge(existing_keys, on=key_cols, how='left', indicator=True)
+        to_add = anti[anti['_merge'] == 'left_only'].drop(columns=['_merge'])
+        # Concat existing with to_add (columns already aligned above)
         out = pd.concat([existing, to_add], ignore_index=True)
     _upload_df_as_csv(container_client, blob_name, out)
 
