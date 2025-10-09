@@ -122,7 +122,6 @@ def _append_notify_csv(container_client, blob_name: str, new_df: pd.DataFrame, k
     for c in existing.columns:
         if c not in new_df.columns:
             new_df[c] = None
-    existing = existing[new_df.columns]         new_df[c] = None
     existing = existing[new_df.columns]
 
     if existing.empty:
